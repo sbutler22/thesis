@@ -1,0 +1,906 @@
+---
+title: "figuring_out_sse"
+format: html
+---
+
+This doc is to try to figure out what it is about this problem that makes WOA perform so much worse.
+
+There are a few ways to try to get a sense of what our solution space looks like, however, none are straightforward because of the high dimensionality. From what we saw this summer, and the literature that I've read, it seems likely that the solution space might have a single narrow valley.
+
+```{r}
+# load libraries
+library(tidyverse)
+library(metaheuristicOpt)
+library(minpack.lm)
+library(furrr)
+library(R.utils)
+library(tictoc)
+library(randtoolbox)
+
+
+# source functions
+source("WOA_functions.R")
+```
+
+# Test functions
+
+## Rastrigin
+
+First let's start with a problem where WOA should do better:
+
+The Rastrigin is multimodal and should be tricky for lma. Here's what it looks like
+
+```{r}
+rastrigin <- function(x) {
+  10 * length(x) + sum(x^2 - 10 * cos(2 * pi * x))
+}
+
+# visualize
+# grid of x and y values
+grid <- expand_grid(
+  x = seq(-5.12, 5.12, length.out = 200),
+  y = seq(-5.12, 5.12, length.out = 200)
+) |>
+  mutate(z = map2_dbl(x, y, ~rastrigin(c(.x, .y))))
+
+# plot
+ggplot(grid, aes(x = x, y = y, fill = z)) +
+  geom_tile() +
+  geom_point(x = 0, y = 0, color = "red", size = 3, shape = 4, stroke = 2) +
+  scale_fill_viridis_c(option = "plasma") +
+  coord_fixed() +
+  labs(title = "2D Rastrigin Function",
+       subtitle = "Red X = global minimum at (0,0)",
+       fill = "Fitness") +
+  theme_minimal()
+
+ggplot(grid, aes(x = z)) + 
+  geom_histogram()
+
+```
+
+
+```{r}
+# rastrigin comparison between woa_levy and lma
+
+# test function
+rastrigin <- function(x) {
+  n <- length(x)
+  10 * n + sum(x^2 - 10 * cos(2 * pi * x))
+}
+
+# WOA with Levy flights (unchanged)
+run_WOA_levy_rastrigin <- function(dimensions = 2, n_whales = 40, max_iter = 500) {
+  bounds <- matrix(c(rep(-5.12, dimensions), 
+                     rep(5.12, dimensions)), 
+                   nrow = 2, byrow = TRUE)
+  
+  result <- WOA_levy_at_end(
+    FUN = rastrigin,
+    optimType = "MIN",
+    numVar = dimensions,
+    numPopulation = n_whales,
+    maxIter = max_iter,
+    rangeVar = bounds
+  )
+  
+  best_fitness <- rastrigin(result)
+  
+  list(
+    params = result,
+    best_fitness = best_fitness,
+    distance_to_optimum = sqrt(sum(result^2))
+  )
+}
+
+# using nls.lm directly
+run_nlslm_rastrigin <- function(dimensions = 2, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  start_point <- runif(dimensions, -5.12, 5.12)
+  
+  # Residual function: decompose Rastrigin into component terms
+  # Rastrigin = 10*n + sum(x^2 - 10*cos(2*pi*x))
+  #           = 10*n + sum(x^2) - 10*sum(cos(2*pi*x))
+  # We'll create residuals for each term
+  
+  # i don't totally understand this part
+  rastrigin_residuals <- function(params) {
+    n <- length(params)
+    residuals <- numeric(2 * n)
+    
+    for (i in 1:n) {
+      residuals[2*i - 1] <- params[i]                    # from x^2 term
+      residuals[2*i] <- sqrt(10) * (1 - cos(2*pi*params[i]))  # from -10*cos term
+    }
+    # Add the constant term 10*n distributed across residuals
+    residuals <- residuals + sqrt(10*n / (2*n))
+    
+    return(residuals)
+  }
+  
+  # run nls.lm
+  result <- tryCatch({
+    nls.lm(
+      par = start_point,
+      fn = rastrigin_residuals,
+      lower = rep(-5.12, dimensions),
+      upper = rep(5.12, dimensions),
+      control = nls.lm.control(maxiter = 1000, ftol = 1e-10, ptol = 1e-10)
+    )
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(result)) {
+    return(list(
+      params = rep(NA, dimensions),
+      best_fitness = NA,
+      distance_to_optimum = NA,
+      convergence = FALSE,
+      start_point = start_point
+    ))
+  }
+  
+  params <- result$par
+  best_fitness <- rastrigin(params)
+  
+  list(
+    params = params,
+    best_fitness = best_fitness,
+    distance_to_optimum = sqrt(sum(params^2)),
+    convergence = result$info %in% 1:3,  # 1, 2, 3 are success codes
+    start_point = start_point
+  )
+}
+
+# comparison function
+compare_rastrigin <- function(dimensions = 2, n_runs = 30) {
+  results <- tibble(run = 1:n_runs) |>
+    mutate(
+      woa = map(run, ~run_WOA_levy_rastrigin(dimensions = dimensions)),
+      woa_fitness = map_dbl(woa, "best_fitness"),
+      woa_distance = map_dbl(woa, "distance_to_optimum"),
+      
+      nlslm = map(run, ~run_nlslm_rastrigin(dimensions = dimensions, seed = .x)),
+      nlslm_fitness = map_dbl(nlslm, "best_fitness"),
+      nlslm_distance = map_dbl(nlslm, "distance_to_optimum"),
+      nlslm_converged = map_lgl(nlslm, "convergence")
+    )
+  
+  summary <- tibble(
+    algorithm = c("WOA_Levy", "nls.lm"),
+    mean_fitness = c(mean(results$woa_fitness), 
+                     mean(results$nlslm_fitness, na.rm = TRUE)),
+    sd_fitness = c(sd(results$woa_fitness), 
+                   sd(results$nlslm_fitness, na.rm = TRUE)),
+    median_fitness = c(median(results$woa_fitness), 
+                       median(results$nlslm_fitness, na.rm = TRUE)),
+    min_fitness = c(min(results$woa_fitness), 
+                    min(results$nlslm_fitness, na.rm = TRUE)),
+    mean_distance = c(mean(results$woa_distance), 
+                      mean(results$nlslm_distance, na.rm = TRUE)),
+    success_rate = c(
+      mean(results$woa_fitness < 1), # lenient
+      mean(results$nlslm_fitness < 1 & results$nlslm_converged, na.rm = TRUE)
+    )
+  )
+  
+  list(results = results, summary = summary)
+}
+
+# test it first
+test_nlslm <- run_nlslm_rastrigin(dimensions = 2, seed = 42)
+test_nlslm$convergence      # Should be TRUE
+test_nlslm$best_fitness     # Should be small (ideally < 1)
+test_nlslm$params           # Should be close to c(0, 0)
+
+# run full comparison
+comparison_rastrigin <- compare_rastrigin(dimensions = 2, n_runs = 30)
+comparison_rastrigin$summary
+
+# visualize
+comparison_rastrigin$results |>
+  select(run, woa_fitness, nlslm_fitness) |>
+  pivot_longer(cols = -run, names_to = "algorithm", values_to = "fitness") |>
+  mutate(algorithm = str_remove(algorithm, "_fitness")) |>
+  ggplot(aes(x = algorithm, y = log10(fitness + 1e-10))) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Rastrigin 2D: WOA Levy vs nls.lm",
+       y = "log10(fitness)") +
+  theme_minimal()
+```
+
+WOA does way better - close to 10 zeroes before the decimal point. That's good, that's what we expect.
+
+## Rosenbrock
+
+The Rosenbrock function has a valley shaped like a banana. It is easy for most algorithms to find the valley, but hard to move around it. LMA should do better
+
+
+```{r}
+# Rosenbrock comparison with woa_levy and lma
+
+rosenbrock <- function(x) {
+  n <- length(x)
+  sum(100 * (x[2:n] - x[1:(n-1)]^2)^2 + (1 - x[1:(n-1)])^2)
+}
+
+# WOA_levy (unchanged)
+run_WOA_levy_rosenbrock <- function(dimensions = 2, n_whales = 40, max_iter = 500) {
+  bounds <- matrix(c(rep(-5, dimensions), 
+                     rep(10, dimensions)), 
+                   nrow = 2, byrow = TRUE)
+  
+  result <- WOA_levy_at_end(
+    FUN = rosenbrock,
+    optimType = "MIN",
+    numVar = dimensions,
+    numPopulation = n_whales,
+    maxIter = max_iter,
+    rangeVar = bounds
+  )
+  
+  best_fitness <- rosenbrock(result)
+  
+  list(
+    params = result,
+    best_fitness = best_fitness,
+    distance_to_optimum = sqrt(sum((result - 1)^2))
+  )
+}
+
+# using nls.lm 
+run_nlslm_rosenbrock <- function(dimensions = 2, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  
+  start_point <- runif(dimensions, -5, 10)
+  
+  # Residual function: nls.lm expects a VECTOR of residuals
+  # We'll decompose the Rosenbrock function into its component terms
+  
+  # dont totally understand
+  rosenbrock_residuals <- function(params) {
+    n <- length(params)
+    residuals <- numeric(2 * (n - 1))
+    
+    for (i in 1:(n-1)) {
+      residuals[2*i - 1] <- 10 * (params[i+1] - params[i]^2)  # sqrt of 100*(x2-x1^2)^2
+      residuals[2*i] <- (1 - params[i])                        # sqrt of (1-x1)^2
+    }
+    
+    return(residuals)
+  }
+  
+  # run nls.lm
+  result <- tryCatch({
+    nls.lm(
+      par = start_point,
+      fn = rosenbrock_residuals,
+      lower = rep(-5, dimensions),
+      upper = rep(10, dimensions),
+      control = nls.lm.control(maxiter = 1000, ftol = 1e-10, ptol = 1e-10)
+    )
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(result)) {
+    return(list(
+      params = rep(NA, dimensions),
+      best_fitness = NA,
+      distance_to_optimum = NA,
+      convergence = FALSE,
+      start_point = start_point
+    ))
+  }
+  
+  params <- result$par
+  best_fitness <- rosenbrock(params)
+  
+  list(
+    params = params,
+    best_fitness = best_fitness,
+    distance_to_optimum = sqrt(sum((params - 1)^2)),
+    convergence = result$info %in% 1:3,  # 1, 2, 3 are success codes
+    start_point = start_point
+  )
+}
+
+# comparison
+compare_rosenbrock <- function(dimensions = 2, n_runs = 30) {
+  results <- tibble(run = 1:n_runs) |>
+    mutate(
+      woa = map(run, ~run_WOA_levy_rosenbrock(dimensions = dimensions)),
+      woa_fitness = map_dbl(woa, "best_fitness"),
+      woa_distance = map_dbl(woa, "distance_to_optimum"),
+      
+      nlslm = map(run, ~run_nlslm_rosenbrock(dimensions = dimensions, seed = .x)),
+      nlslm_fitness = map_dbl(nlslm, "best_fitness"),
+      nlslm_distance = map_dbl(nlslm, "distance_to_optimum"),
+      nlslm_converged = map_lgl(nlslm, "convergence")
+    )
+  
+  summary <- tibble(
+    algorithm = c("WOA_Levy", "nls.lm"),
+    mean_fitness = c(mean(results$woa_fitness), 
+                     mean(results$nlslm_fitness, na.rm = TRUE)),
+    median_fitness = c(median(results$woa_fitness), 
+                       median(results$nlslm_fitness, na.rm = TRUE)),
+    min_fitness = c(min(results$woa_fitness), 
+                    min(results$nlslm_fitness, na.rm = TRUE)),
+    success_rate = c(
+      mean(results$woa_fitness < 1e-6),
+      mean(results$nlslm_fitness < 1 & results$nlslm_converged, na.rm = TRUE)
+    )
+  )
+  
+  list(results = results, summary = summary)
+}
+
+# test it first
+test_nlslm <- run_nlslm_rosenbrock(dimensions = 2, seed = 42)
+test_nlslm$convergence      # Should be TRUE
+test_nlslm$best_fitness     # Should be close to 0
+test_nlslm$params           # Should be close to c(1, 1)
+
+# if that works, run full comparison
+comparison_rosenbrock <- compare_rosenbrock(dimensions = 2, n_runs = 30)
+comparison_rosenbrock$summary
+
+# visualize
+comparison_rosenbrock$results |>
+  select(run, woa_fitness, nlslm_fitness) |>
+  pivot_longer(cols = -run, names_to = "algorithm", values_to = "fitness") |>
+  mutate(algorithm = str_remove(algorithm, "_fitness")) |>
+  ggplot(aes(x = algorithm, y = log10(fitness + 1e-10))) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Rosenbrock 2D: WOA Levy vs nls.lm",
+       y = "log10(fitness)") +
+  theme_minimal()
+```
+
+As expected, lma does better. It converges perfectly except for when it has a bad random starting point which seems to happen about 7% of the time but would go to zero with multiple random starts.
+
+
+# trying grid search
+
+a more lenient sse algorithm...
+
+```{r}
+# the sse func doesn't create cliffs by penalizing with huge sse
+# objective_SSE_double <- function(x, data) {
+#   h0 <- x[1]; h1 <- x[2]; h2 <- x[3]
+#   a1 <- x[4]; a2 <- x[5]; t1 <- x[6]; t2 <- x[7]
+#   
+#   # Soft penalties that guide rather than block
+#   penalty <- 0
+#   if (h1 <= h0) penalty <- penalty + 1000 * (h0 - h1)^2
+#   if (h1 <= h2) penalty <- penalty + 1000 * (h2 - h1)^2
+#   if (t2 <= t1) penalty <- penalty + 1000 * (t1 - t2)^2
+#   if (a1 <= 0) penalty <- penalty + 1000 * a1^2
+#   if (a2 <= 0) penalty <- penalty + 1000 * a2^2
+#   
+#   sse <- tryCatch({
+#     sse_func_double(h0, h1, h2, a1, a2, t1, t2, data) + penalty
+#   }, error = function(e) {
+#     1e10
+#   })
+#   
+#   return(sse)
+# }
+```
+
+
+```{r}
+# Grid search over double sigmoid sse space 
+
+# generate test data
+set.seed(42)
+test_data <- generate_piecewise_data(
+  x_vals = seq(0, 300, by = 20), 
+  reps = 5, 
+  dispersion = 10,
+  a1 = 0.04, a2 = 0.03, t1 = 110, t2 = 240, 
+  h1 = 750, h2 = 400, h0 = 20
+)
+
+# define bounds
+bounds_lower <- c(h0 = -0.10, h1 = 0.30, h2 = 0.00, a1 = 0.01, a2 = 0.01, t1 = -0.52, t2 = -0.48)
+bounds_upper <- c(h0 = 0.30, h1 = 0.97, h2 = 1.00, a1 = 180.00, a2 = 180.00, t1 = 1.15, t2 = 1.79)
+
+# helper function to get interior points (excluding bounds)
+interior_points <- function(lower, upper, n_interior = 5) {
+  # generate n_interior + 2 points (including bounds)
+  all_points <- seq(lower, upper, length.out = n_interior + 2)
+  # drop first and last (the bounds)
+  all_points[2:(n_interior + 1)]
+}
+
+# helper function for logarithmic interior points
+interior_points_log <- function(lower, upper, n_interior = 5) {
+  all_points <- 10^seq(log10(lower), log10(upper), length.out = n_interior + 2)
+  all_points[2:(n_interior + 1)]
+}
+
+# create grid with 5 interior points per parameter
+grid_params <- expand_grid(
+  h0 = interior_points(bounds_lower["h0"], bounds_upper["h0"], 5),
+  h1 = interior_points(bounds_lower["h1"], bounds_upper["h1"], 5),
+  h2 = interior_points(bounds_lower["h2"], bounds_upper["h2"], 5),
+  a1 = interior_points_log(bounds_lower["a1"], bounds_upper["a1"], 5),
+  a2 = interior_points_log(bounds_lower["a2"], bounds_upper["a2"], 5),
+  t1 = interior_points(bounds_lower["t1"], bounds_upper["t1"], 5),
+  t2 = interior_points(bounds_lower["t2"], bounds_upper["t2"], 5)
+)
+
+# this creates 5^7 = 78125 combinations
+
+cat("Total parameter combinations:", nrow(grid_params), "\n")
+
+# compute SSE for each combination
+grid_results <- grid_params |>
+  mutate(
+    sse = pmap_dbl(list(h0, h1, h2, a1, a2, t1, t2), ~{
+      params <- c(..1, ..2, ..3, ..4, ..5, ..6, ..7)
+      objective_SSE_double(params, test_data)
+    })
+  )
+
+# summary statistics
+summary(grid_results$sse)
+
+# best combo - not necessarily helpful
+best_combo <- grid_results |>
+  arrange(sse) |>
+  slice(1)
+
+cat("\nBest parameter combination:\n")
+print(best_combo)
+
+# plot distribution of SSE values
+ggplot(grid_results, aes(x = log10(sse))) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  geom_vline(xintercept = log10(best_combo$sse), color = "red", 
+             linetype = "dashed", size = 1) +
+  labs(title = "Distribution of SSE Values Across Parameter Grid",
+       subtitle = paste("Best SSE:", round(best_combo$sse, 2)),
+       x = "log10(SSE)",
+       y = "Count") +
+  theme_minimal()
+
+# Save results
+# saveRDS(grid_results, "grid_search_results.rds")
+
+```
+
+
+This plot confirms that there is some kind of narrow valley since so many of the parameter combos are terrible and some are good. There aren't really any in between so it seems like you are either "in" the valley or out of it. I also removed the parameter values that are on the upper and lower bounds since those are obviously bad, and we still see this effect. 
+
+
+# heat map
+
+The point of this map is to take the euclidian distance between different param vectors with low SSE to see if they are far apart. If so, we might have two minimums or maybe just a long skinny canyon.
+
+```{r}
+# filter only reasonable sse vals
+solid_sse_vals <- grid_results |>
+  filter(sse < 100000) #log10(sse) = 5
+
+# order by sse (best to worst)
+solid_sse_ordered <- solid_sse_vals |>
+  arrange(sse) |>
+  mutate(rank = row_number())
+
+# Take top 100 best solutions
+solid_sse_subset <- solid_sse_vals |>
+  arrange(sse) |>
+  slice(1:100) |>
+  mutate(rank = row_number())
+
+n <- nrow(solid_sse_subset)
+param_cols <- c("h0", "h1", "h2", "a1", "a2", "t1", "t2")
+
+# Compute pairwise distances
+distance_matrix <- expand_grid(
+  rank_i = 1:n,
+  rank_j = 1:n
+) |>
+  mutate(
+    distance = map2_dbl(rank_i, rank_j, ~{
+      vec_i <- as.numeric(solid_sse_subset[.x, param_cols])
+      vec_j <- as.numeric(solid_sse_subset[.y, param_cols])
+      sqrt(sum((vec_i - vec_j)^2))
+    })
+  )
+
+ggplot(distance_matrix, aes(x = rank_i, y = rank_j, fill = distance)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(
+    title = "Euclidean Distance Between Top 100 Solutions",
+    subtitle = "Ordered by SSE (best to worst)",
+    x = "SSE Rank",
+    y = "SSE Rank",
+    fill = "Distance"
+  ) +
+  theme_minimal() +
+  coord_fixed()
+
+  
+```
+
+If I just eliminate the terrible combinations, I still have 36,000 SSE values, and it is not feasible to plot a 36k x 36k plot. So, I am taking only the 100 best. Depending how that look I might try taking a more random sample to see if they look any different.
+
+Analysis:
+
+- We expect some of the best solutions to be far away in a narrow valley, i.e. doesn't necessarily mean two minimums
+- We should be careful with euclidian distances because the scale of some parameters (a1, a2) is so different from the rest
+  - In the many clusters that we have (purple), we know there are similar parameterizations that produce similar SSE
+- If space was multi-modal, then this would be more speckled??
+  - If the landscape were dominated by many local minima, you would expect (from CHAT):
+    - A more “speckled” pattern
+    - No clean blocks
+    - Best solutions scattered broadly in parameter space
+    - But instead you see:
+    - Strong clustering
+    - Clear separation between clusters
+    - Smooth ordering by SSE within clusters
+
+- Consider the bars that are orange, like at 26,27. This means that they are far from almost every other good SSE (different params) but generate a similarly good curve... this would make sense if tradeoffs in a1, a2, and t1, t2, could counter balance each other.
+
+
+
+
+```{r}
+# Get the 2nd, 27th, and 50th best parameter sets
+solution_2 <- solid_sse_subset |> filter(rank == 2)
+solution_27 <- solid_sse_subset |> filter(rank == 27)
+solution_50 <- solid_sse_subset |> filter(rank == 50)
+
+# Check their SSE values
+cat("2nd best SSE:", solution_2$sse, "\n")
+cat("27th best SSE:", solution_27$sse, "\n")
+cat("50th best SSE:", solution_50$sse, "\n")
+
+# Generate predictions for all three solutions
+# Create time values to match your data range (normalized 0-1)
+time_vals <- seq(0, 2, length.out = 400)
+
+# Function to generate predictions
+generate_predictions <- function(params, time_vals) {
+  predictions <- double_sig_fit_formula(
+    time = time_vals,
+    h0 = params$h0,
+    h1 = params$h1,
+    h2 = params$h2,
+    a1 = params$a1,
+    a2 = params$a2,
+    t1 = params$t1,
+    t2 = params$t2
+  )
+  
+  tibble(
+    time = time_vals,
+    intensity = predictions
+  )
+}
+
+# Generate predictions for all three
+pred_2 <- generate_predictions(solution_2, time_vals) |>
+  mutate(solution = "Rank 2")
+
+pred_27 <- generate_predictions(solution_27, time_vals) |>
+  mutate(solution = "Rank 27")
+
+pred_50 <- generate_predictions(solution_50, time_vals) |>
+  mutate(solution = "Rank 50")
+
+# Combine predictions
+all_preds <- bind_rows(pred_2, pred_27, pred_50)
+
+# Plot the curves with the original data
+ggplot() +
+  # Original data points
+  geom_point(data = test_data, aes(x = time, y = intensity),
+             alpha = 0.5, color = "gray50", size = 2) +
+  # Fitted curves
+  geom_line(data = all_preds, aes(x = time, y = intensity, color = solution),
+            linewidth = 1.2) +
+  scale_color_manual(values = c("Rank 2" = "#E41A1C", 
+                                 "Rank 27" = "#377EB8",
+                                 "Rank 50" = "#4DAF4A")) +
+  labs(
+    title = "Comparison of 2nd, 27th, and 50th Best Solutions",
+    subtitle = paste0("Rank 2 SSE: ", round(solution_2$sse, 2), 
+                     " | Rank 27 SSE: ", round(solution_27$sse, 2),
+                     " | Rank 50 SSE: ", round(solution_50$sse, 2)),
+    x = "Time (normalized)",
+    y = "Intensity (normalized)",
+    color = "Solution"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Parameter comparison plot
+param_cols <- c("h0", "h1", "h2", "a1", "a2", "t1", "t2")
+
+param_comparison <- bind_rows(
+  solution_2 |> select(all_of(param_cols), sse) |> mutate(Rank = "2nd"),
+  solution_27 |> select(all_of(param_cols), sse) |> mutate(Rank = "27th"),
+  solution_50 |> select(all_of(param_cols), sse) |> mutate(Rank = "50th")
+) |>
+  pivot_longer(cols = all_of(param_cols), names_to = "Parameter", values_to = "Value")
+
+ggplot(param_comparison, aes(x = Parameter, y = Value, fill = Rank)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("2nd" = "#E41A1C", 
+                                "27th" = "#377EB8",
+                                "50th" = "#4DAF4A")) +
+  labs(
+    title = "Parameter Values: 2nd vs 27th vs 50th Best Solutions",
+    subtitle = "Comparing parameters across different SSE ranks"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print comparison
+cat("\n2nd Best Parameters:\n")
+print(solution_2 |> select(all_of(param_cols), sse))
+
+cat("\n27th Best Parameters:\n")
+print(solution_27 |> select(all_of(param_cols), sse))
+
+cat("\n50th Best Parameters:\n")
+print(solution_50 |> select(all_of(param_cols), sse))
+
+# Calculate pairwise Euclidean distances
+dist_2_27 <- sqrt(sum((as.numeric(solution_2[, param_cols]) - 
+                       as.numeric(solution_27[, param_cols]))^2))
+dist_2_50 <- sqrt(sum((as.numeric(solution_2[, param_cols]) - 
+                       as.numeric(solution_50[, param_cols]))^2))
+dist_27_50 <- sqrt(sum((as.numeric(solution_27[, param_cols]) - 
+                        as.numeric(solution_50[, param_cols]))^2))
+
+cat("\nPairwise Euclidean Distances:\n")
+cat("Rank 2 to Rank 27:", round(dist_2_27, 4), "\n")
+cat("Rank 2 to Rank 50:", round(dist_2_50, 4), "\n")
+cat("Rank 27 to Rank 50:", round(dist_27_50, 4), "\n")
+
+cat("\nSSE Differences:\n")
+cat("Rank 2 to Rank 27:", round(abs(solution_2$sse - solution_27$sse), 4), "\n")
+cat("Rank 2 to Rank 50:", round(abs(solution_2$sse - solution_50$sse), 4), "\n")
+cat("Rank 27 to Rank 50:", round(abs(solution_27$sse - solution_50$sse), 4), "\n")
+```
+
+
+# Z scores
+
+Since the scales of the parameter a are so different, we transform all param estimates into z scores to make the distributions equal...
+
+```{r}
+# Step 1: Calculate z-scores for each parameter
+solid_sse_subset_standardized <- solid_sse_subset |>
+  mutate(
+    h0_z = (h0 - mean(h0)) / sd(h0),
+    h1_z = h1, # all the same value so wont contribute to distance
+    h2_z = (h2 - mean(h2)) / sd(h2),
+    a1_z = (a1 - mean(a1)) / sd(a1),
+    a2_z = (a2 - mean(a2)) / sd(a2),
+    t1_z = (t1 - mean(t1)) / sd(t1),
+    t2_z = (t2 - mean(t2)) / sd(t2)
+  )
+
+# Define standardized parameter columns
+param_cols_z <- c("h0_z", "h1_z", "h2_z", "a1_z", "a2_z", "t1_z", "t2_z")
+
+# Step 2: Compute pairwise distances using z-scores
+distance_matrix_z <- expand_grid(
+  rank_i = 1:n,
+  rank_j = 1:n
+) |>
+  mutate(
+    distance = map2_dbl(rank_i, rank_j, ~{
+      vec_i <- as.numeric(solid_sse_subset_standardized[.x, param_cols_z])
+      vec_j <- as.numeric(solid_sse_subset_standardized[.y, param_cols_z])
+      sqrt(sum((vec_i - vec_j)^2))
+    })
+  )
+
+# Step 3: Plot with standardized distances
+ggplot(distance_matrix_z, aes(x = rank_i, y = rank_j, fill = distance)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(
+    title = "Euclidean Distance Between Top 100 Solutions (Standardized)",
+    subtitle = "Parameters converted to z-scores before distance calculation",
+    x = "SSE Rank",
+    y = "SSE Rank",
+    fill = "Standardized\nDistance"
+  ) +
+  theme_minimal() +
+  coord_fixed()
+```
+
+```{r}
+# Get the 5th, 35th, and 50th best parameter sets
+solution_5 <- solid_sse_subset_standardized |> filter(rank == 5)
+solution_35 <- solid_sse_subset_standardized |> filter(rank == 35)
+solution_50 <- solid_sse_subset_standardized |> filter(rank == 50)
+
+# Check their SSE values
+cat("5th best SSE:", solution_5$sse, "\n")
+cat("35th best SSE:", solution_35$sse, "\n")
+cat("50th best SSE:", solution_50$sse, "\n")
+
+# Generate predictions for all three solutions
+# Create time values to match your data range (normalized 0-1)
+time_vals <- seq(0, 2, length.out = 400)
+
+# Function to generate predictions
+# CANT PLOT Z SCORES
+generate_predictions <- function(params, time_vals) {
+  predictions <- double_sig_fit_formula(
+    time = time_vals,
+    h0 = params$h0,
+    h1 = params$h1,
+    h2 = params$h2,
+    a1 = params$a1,
+    a2 = params$a2,
+    t1 = params$t1,
+    t2 = params$t2
+  )
+  
+  tibble(
+    time = time_vals,
+    intensity = predictions
+  )
+}
+
+# Generate predictions for all three
+pred_5 <- generate_predictions(solution_5, time_vals) |>
+  mutate(solution = "Rank 5")
+
+pred_35 <- generate_predictions(solution_35, time_vals) |>
+  mutate(solution = "Rank 35")
+
+pred_50 <- generate_predictions(solution_50, time_vals) |>
+  mutate(solution = "Rank 50")
+
+# Combine predictions
+all_preds <- bind_rows(pred_5, pred_35, pred_50)
+
+# Plot the curves with the original data
+ggplot() +
+  # Original data points
+  geom_point(data = test_data, aes(x = time, y = intensity),
+             alpha = 0.5, color = "gray50", size = 2) +
+  # Fitted curves
+  geom_line(data = all_preds, aes(x = time, y = intensity, color = solution),
+            linewidth = 1.2) +
+  scale_color_manual(values = c("Rank 5" = "#E41A1C", 
+                                 "Rank 35" = "#377EB8",
+                                 "Rank 50" = "#4DAF4A")) +
+  labs(
+    title = "Comparison of 5th, 35th, and 50th Best Solutions",
+    subtitle = paste0("Rank 5 SSE: ", round(solution_5$sse, 2), 
+                     " | Rank 35 SSE: ", round(solution_35$sse, 2),
+                     " | Rank 50 SSE: ", round(solution_50$sse, 2)),
+    x = "Time (normalized)",
+    y = "Intensity (normalized)",
+    color = "Solution"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# Parameter comparison plot - use ORIGINAL scale parameters, not z-scores
+param_cols <- c("h0_z", "h1_z", "h2_z", "a1_z", "a2_z", "t1_z", "t2_z")
+
+param_comparison <- bind_rows(
+  solution_5 |> select(all_of(param_cols), sse) |> mutate(Rank = "5th"),
+  solution_35 |> select(all_of(param_cols), sse) |> mutate(Rank = "35th"),
+  solution_50 |> select(all_of(param_cols), sse) |> mutate(Rank = "50th")
+) |>
+  pivot_longer(cols = all_of(param_cols), names_to = "Parameter", values_to = "Value")
+
+ggplot(param_comparison, aes(x = Parameter, y = Value, fill = Rank)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("5th" = "#E41A1C", 
+                                "35th" = "#377EB8",
+                                "50th" = "#4DAF4A")) +
+  labs(
+    title = "Parameter Values: 5th vs 35th vs 50th Best Solutions",
+    subtitle = "Comparing parameters across different SSE ranks"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Print comparison
+cat("\n5th Best Parameters:\n")
+print(solution_5 |> select(all_of(param_cols), sse))
+
+cat("\n35th Best Parameters:\n")
+print(solution_35 |> select(all_of(param_cols), sse))
+
+cat("\n50th Best Parameters:\n")
+print(solution_50 |> select(all_of(param_cols), sse))
+
+# Calculate pairwise Euclidean distances (using STANDARDIZED parameters)
+param_cols_z <- c("h0_z", "h1_z", "h2_z", "a1_z", "a2_z", "t1_z", "t2_z")
+
+dist_5_35 <- sqrt(sum((as.numeric(solution_5[, param_cols_z]) - 
+                       as.numeric(solution_35[, param_cols_z]))^2))
+dist_5_50 <- sqrt(sum((as.numeric(solution_5[, param_cols_z]) - 
+                       as.numeric(solution_50[, param_cols_z]))^2))
+dist_35_50 <- sqrt(sum((as.numeric(solution_35[, param_cols_z]) - 
+                        as.numeric(solution_50[, param_cols_z]))^2))
+
+cat("\nPairwise Euclidean Distances (Standardized):\n")
+cat("Rank 5 to Rank 35:", round(dist_5_35, 4), "\n")
+cat("Rank 5 to Rank 50:", round(dist_5_50, 4), "\n")
+cat("Rank 35 to Rank 50:", round(dist_35_50, 4), "\n")
+
+cat("\nSSE Differences:\n")
+cat("Rank 5 to Rank 35:", round(abs(solution_5$sse - solution_35$sse), 4), "\n")
+cat("Rank 5 to Rank 50:", round(abs(solution_5$sse - solution_50$sse), 4), "\n")
+cat("Rank 35 to Rank 50:", round(abs(solution_35$sse - solution_50$sse), 4), "\n")
+```
+
+I want to get a sense if the param combinations that are the same as ones we have but just with differences in a1 will yield similar SSEs. The orange blocks in the heat map seem to signal mainly differences in a1.
+
+```{r}
+# Group by all parameters except a1, see if any groups have multiple rows
+same_except_a1 <- solid_sse_subset |>
+  group_by(h0, h1, h2, a2, t1, t2) |>
+  filter(n() > 1) |>
+  arrange(h0, h1, h2, a2, t1, t2, a1)
+
+same_except_a1
+```
+
+
+```{r}
+same_except_a1 |>
+  ggplot(aes(x = a1, y = sse)) +
+  geom_point()
+```
+
+```{r}
+# check values between 6.868285 and 35.16093
+a1_values <- seq(5, 50, length.out = 45)
+
+# create dataframe with fixed parameters except a1
+small_df <- tibble(
+  h0 = -0.03333333,
+  h1 = 0.8583333,
+  h2 = 0.1666667,
+  a1 = a1_values,
+  a2 = 6.868285,
+  t1 = 0.315,
+  t2 = 1.033333) |>
+  rowwise() |>
+  mutate(
+    sse = objective_SSE_double(c(h0, h1, h2, a1, a2, t1, t2), test_data)) |>
+  ungroup()
+
+small_df |>
+  ggplot(aes(x = a1, y = sse)) +
+  geom_point() +
+  geom_vline(xintercept = 6.868285, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 35.16093, color = "red", linetype = "dashed") 
+
+```
+
+```{r}
+# this is to see how params vary (besides a1) in the vectors that are far away
+a1_six_eight <- solid_sse_subset |>
+  filter(a1 <= 7 & a1 > 6)
+a1_six_eight
+```
+
+
+

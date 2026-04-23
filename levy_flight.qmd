@@ -1,0 +1,312 @@
+---
+title: "levy_flight"
+format: html
+---
+
+Here I'm trying to get a sense of what the Lévy flight distribution looks like. 
+
+I'm going to use Mantegna's alogrithm which says:
+
+levy($\lambda$) = $\frac{\mu}{|v|^\frac{1}{\lambda}}$ and perhaps we can think ab
+
+This one is with $\beta$:
+
+```{r}
+# params
+beta <- 1.5    
+n <- 10000     
+
+# defining sigma_u - we can use the gamma() in r
+sigma_u <- (gamma(1 + beta) * sin(pi * beta / 2) /
+               (gamma((1 + beta) / 2) * beta * 2^((beta - 1) / 2)))^(1 / beta)
+
+# generate u and v
+u <- rnorm(n, mean = 0, sd = sigma_u)
+v <- rnorm(n, mean = 0, sd = 1)
+
+# use to get step lengths
+s <- u / (abs(v)^(1 / beta))
+
+s <- data.frame(s)
+
+# Visualize
+s |>
+  ggplot(aes(x = s)) +
+  geom_histogram(bins = 200, fill = "violet", color = "black") +
+  # coord_cartesian(xlim = c(-250, 250)) +
+  labs(title = "Lévy flight Step Sizes",
+       x = "Step length (s)", y = "Frequency") +
+  theme_minimal()
+
+quantile(s$s, probs = c(0, 0.01, 0.1, 0.5, 0.9, 0.99, 1))
+
+```
+
+This one is just with $\lambda$:
+
+I could rewrite this easily to try different values of beta instead.
+
+```{r}
+# write function to run levy-flight with different lambda vals
+levy_flight <- function(n = 10000, lambda = 1.5) {
+  
+  
+  # same formula as above but lambda instead of beta
+  sigma_u <- (gamma(1 + lambda) * sin(pi * lambda / 2) /
+               (gamma((1 + lambda) / 2) * lambda * 2^((lambda - 1) / 2)))^(1 / lambda)
+  
+  # same u and v
+  u <- rnorm(n, mean = 0, sd = sigma_u)
+  v <- rnorm(n, mean = 0, sd = 1)
+  
+  # generate s
+  s <- u / abs(v)^(1 / lambda)
+  
+  tibble(s = s, lambda = lambda)
+}
+
+# then run for different values of lambda
+lambda_vals <- c(1.2, 1.5, 2.0) # for some reason 2.5 and 3 gave NA - must be with sin()
+
+levy_data <- map_df(lambda_vals, ~levy_flight(n = 10000, lambda = .x))
+
+# and plot
+levy_data |>
+  ggplot(aes(x = s)) +
+  geom_histogram(bins = 500, fill = "violet", color = "black") +
+  facet_wrap(~lambda) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  labs(title = "Lévy Flight Step Sizes",
+       x = "Step length (s)", y = "Frequency",
+       subtitle = "λ values from (1, 2]") +
+  theme_minimal()
+
+```
+
+```{r}
+
+# write function to run levy-flight with different lambda vals
+levy_flight_beta <- function(n = 10000, beta = 1.5) {
+  
+  
+  # same formula as above but lambda instead of beta
+  sigma_u <- (gamma(1 + beta) * sin(pi * beta / 2) /
+               (gamma((1 + beta) / 2) * beta * 2^((beta - 1) / 2)))^(1 / beta)
+  
+  # same u and v
+  u <- rnorm(n, mean = 0, sd = sigma_u)
+  v <- rnorm(n, mean = 0, sd = 1)
+  
+  # generate s
+  s <- u / abs(v)^(1 / beta)
+  
+  tibble(s = s, beta = beta)
+}
+
+# then run for different values of lambda
+beta_vals <- c(1.2, 1.5, 1.8) # between 0 and 2
+
+levy_data_beta <- map_df(beta_vals, ~levy_flight_beta(n = 10000, beta = .x))
+
+# and plot
+levy_data_beta |>
+  ggplot(aes(x = s)) +
+  geom_histogram(bins = 5000, fill = "violet", color = "black") +
+  facet_wrap(~beta) +
+  coord_cartesian(xlim = c(-100, 100)) +
+  labs(title = "Lévy Flight Step Sizes",
+       x = "Step length (s)", y = "Frequency",
+       subtitle = "λ values from (1, 2]") +
+  theme_minimal()
+```
+
+# combine with woa
+
+```{r}
+levy_step <- function(n = 10000, beta = 1.5) {
+  
+  
+  # same formula as above but lambda instead of beta
+  sigma_u <- (gamma(1 + beta) * sin(pi * beta / 2) /
+               (gamma((1 + beta) / 2) * beta * 2^((beta - 1) / 2)))^(1 / beta)
+  
+  # same u and v
+  u <- rnorm(n, mean = 0, sd = sigma_u)
+  v <- rnorm(n, mean = 0, sd = 1)
+  
+  # generate s
+  s <- u / abs(v)^(1 / beta)
+  
+  return(s)
+}
+```
+
+New engineWOA: I am basically jittering every whale at the end by moving them by one levy step. I'm not sure if that is where it makes the most sense to do it. 
+
+```{r}
+engine_WOA_levy_at_end <- function(FUN, optimType, maxIter, lowerBound, upperBound, whale) {
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2)/maxIter)
+    a2 <- -1 + t * ((-1)/maxIter)
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      l <- (a2 - 1) * runif(1) + 1
+      p <- runif(1)
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * runif(1) + 
+              1)
+            x.rand <- whale[rand.index, ]
+            D.x.rand <- abs(C * x.rand[j] - whale[i, 
+              j])
+            whale[i, j] <- x.rand[j] - A * D.x.rand
+          }
+          else if (abs(A) < 1) {
+            D.bestPos <- abs(C * bestPos[j] - whale[i, 
+              j])
+            whale[i, j] <- bestPos[j] - A * D.bestPos
+          }
+        }
+        else if (p >= 0.5) {
+          distance <- abs(bestPos[j] - whale[i, j])
+          whale[i, j] <- distance * exp(b * l) * cos(l * 
+            2 * pi) + bestPos[j]
+        }
+      }
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, 
+        upperBound)
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    
+# this is the levy part
+    
+scalar <- 0.01  # step-size scaling which we could tune...
+
+for (i in 1:nrow(whale)) {
+  # generate levy vector for each whale
+  s <- levy_step(n = ncol(whale), beta = 1.5)
+  
+  # move whale by one levy step
+  whale[i, ] <- whale[i, ] + scalar * s
+  
+  # check bounds
+  whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+  
+  # recalc fitness
+  fitness <- optimType * FUN(whale[i, ])
+  if (fitness < FbestPos) {
+    FbestPos <- fitness
+    bestPos <- whale[i, ]
+  }
+}
+    # end of levy part
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+```
+
+
+```{r}
+WOA_levy_at_end <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+  maxIter = 500, rangeVar) 
+{
+  dimension <- ncol(rangeVar)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  if (optimType == "MAX") 
+    optimType <- -1
+  else optimType <- 1
+  whale <- generateRandom(numPopulation, dimension, lowerBound, 
+    upperBound)
+  bestPos <- engine_WOA_levy_at_end(FUN, optimType, maxIter, lowerBound, 
+    upperBound, whale)
+  return(bestPos)
+}
+```
+
+
+```{r}
+# define data
+set.seed(47)
+double_data <- generate_piecewise_data()
+
+# objective function is SSE
+objective_SSE_double <- function(x, data) {
+  h0 <- x[1]
+  h1 <- x[2]
+  h2 <- x[3]
+  a1 <- x[4]
+  a2 <- x[5]
+  t1 <- x[6]
+  t2 <- x[7]
+  
+  sse <- data |>
+    mutate(
+      preds = h0 +
+              (h1 - h0) / (1 + exp(-a1 * (time - t1))) +
+              (h1 - h2) / (1 + exp(-a2 * (time - t2))),
+      diff = (intensity - preds)^2
+    ) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  
+  return(sse)
+}
+
+# upper and lower bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48, # this messes up midpoint distance
+                   0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79), nrow = 2, byrow = TRUE)
+
+
+tic()
+# run WOA
+sse_result <- WOA_levy_at_end(
+  FUN = function(x) objective_SSE_double(x, double_data),
+  optimType = "MIN",
+  numVar = ncol(bounds),
+  numPopulation = 40, # default 40
+  maxIter = 500, # default 500
+  rangeVar = bounds)
+
+toc()
+
+best_sse <- objective_SSE_double(sse_result, double_data)
+
+print(sse_result)
+print(best_sse)
+```
+
+
+
+
+
+
+
+
+
+
+

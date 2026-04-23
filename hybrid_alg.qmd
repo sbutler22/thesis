@@ -1,0 +1,1984 @@
+---
+title: "hybrid_alg"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tictoc)
+```
+
+```{r}
+source("WOA_functions.R")
+```
+
+
+The idea for the hybrid function is that the transition is triggered by a diversity score with WOA - when it shrinks to a certain threshold (5% diversity) the alg switches to lma. diversity is calculated by finding the median whale in each dimension, then for each dimension d, it computes the mean absolute deviation from the median across all N whales, then averages those D values. If this doesn't happen within a certain number of iterations, then the switch to lma will automatically happen, (default is 200). When the diversity has shrunk to 5% of it's initial value, lma is run from the best k whales as long as they are sufficiently far apart. k is capped at 10, but is a hyperparameter set by the user between 1 and 10. In terms of chosing which whales should be used as starting points for lma, min_dist = 0.05 means a whale must be at least 5% of the search space diameter away from all existing whales. I'm not yet sure if this is the right value...
+
+
+# woa_lma_hybrid
+
+```{r}
+# ============================================================
+# WOA-LMA Hybrid Optimizer
+# ============================================================
+# Packages: minpack.lm, metaheuristicOpt (for generateRandom
+#           and checkBound helpers)
+# install.packages(c("minpack.lm", "metaheuristicOpt"))
+#
+# DESIGN
+# ------
+# Phase 1 — WOA global search
+#   Runs the standard WOA loop iteration by iteration.
+#   At each iteration, population diversity is computed using the
+#   median-based formula from Nadimi-Shahraki et al. (2023):
+#     Diversity(t) = (1/D) * sum_d [ (1/N) * sum_i |median{x_d(t)} - x_id(t)| ]
+#   i.e. for each dimension d, compute the mean absolute deviation
+#   from the median across all N whales, then average over all D dims.
+#   Transition to Phase 2 is triggered when:
+#     (a) diversity drops below `div_threshold`, OR
+#     (b) the iteration cap `max_iter_woa` is reached.
+#
+# Phase 2 — LMA local refinement
+#   The top `n_lma` whales by fitness are selected as LMA seeds.
+#   A minimum distance filter (`min_dist`) removes seeds that
+#   are too close to each other, keeping the most diverse set.
+#   LMA is run from each surviving seed via nls.lm().
+#   The best converged LMA result is returned as the final answer.
+#
+# INPUTS
+# ------
+#   FUN           : objective function f(params) -> scalar
+#   residual_fn   : residual function for LMA, r(params) -> vector
+#                   such that sum(r^2) = FUN(params).
+#                   If NULL, a generic single-residual wrapper is
+#                   used (less accurate Jacobian, but still works).
+#   numVar        : number of variables
+#   rangeVar      : 2 x numVar matrix, row 1 = lower, row 2 = upper
+#   numPopulation : WOA population size         (default 40)
+#   max_iter_woa  : hard iteration cap for WOA  (default 200)
+#   div_threshold : diversity trigger (normalised, 0-1)
+#                   set relative to initial diversity (default 0.05)
+#   n_lma         : max number of LMA seeds     (default 5, max 10)
+#   min_dist      : minimum Euclidean distance between seeds
+#                   as fraction of search space diameter (default 0.05)
+#   lm_control    : nls.lm.control() list passed to each LMA run
+#   verbose       : print progress messages     (default TRUE)
+#
+# OUTPUT
+# ------
+# A list with:
+#   $par            : best parameter vector found
+#   $value          : objective value at $par
+#   $woa_iters      : number of WOA iterations run
+#   $trigger        : "diversity" or "max_iter"
+#   $lma_results    : list of all individual LMA outputs
+#   $lma_best_idx   : index of the winning LMA seed
+#   $woa_history    : data.frame of per-iteration WOA best fitness
+#                     and diversity (useful for plotting)
+#   $seeds_used     : matrix of LMA starting positions after filtering
+# ============================================================
+
+library(minpack.lm)
+library(metaheuristicOpt)   # for generateRandom() and checkBound()
+
+# ------------------------------------------------------------
+# MAIN HYBRID FUNCTION
+# ------------------------------------------------------------
+woa_lma_hybrid <- function(
+    FUN,
+    residual_fn   = NULL,
+    numVar,
+    rangeVar,
+    numPopulation = 40,
+    max_iter_woa  = 200,
+    div_threshold = 0.05,      # fraction of initial diversity
+    n_lma         = 10,
+    min_dist      = 0.01,      # fraction of search space diameter
+    lm_control    = nls.lm.control(maxiter = 500, ftol = 1e-12,
+                                    ptol = 1e-12),
+    verbose       = TRUE
+) {
+
+  # ---- input checks ----------------------------------------
+  n_lma <- min(max(n_lma, 1), 10)
+  stopifnot(nrow(rangeVar) == 2, ncol(rangeVar) == numVar)
+
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+
+  # search space diameter — used to scale min_dist
+  space_diam <- sqrt(sum((upperBound - lowerBound)^2))
+  abs_min_dist <- min_dist * space_diam
+
+  # ---- generic residual wrapper if none provided -----------
+  # Single residual: r = sqrt(f + eps). LMA still converges but
+  # the Jacobian is less informative than a natural formulation.
+  if (is.null(residual_fn)) {
+    if (verbose) message(
+      "[hybrid] No residual_fn supplied — using sqrt(FUN) wrapper.\n",
+      "         For best LMA performance, supply a natural residual."
+    )
+    residual_fn <- function(params) sqrt(FUN(params) + 1e-10)
+  }
+
+  # ---- helper: population diversity -----------------------
+  # Median-based diversity (Nadimi-Shahraki et al., 2023):
+  #   Diversity(t) = (1/D) * sum_d [ (1/N) * sum_i |median{x_d} - x_id| ]
+  # For each dimension d, compute the mean absolute deviation of all
+  # whale positions from the median of that dimension, then average
+  # those values across all D dimensions.
+  compute_diversity <- function(whale_mat) {
+    D       <- ncol(whale_mat)
+    dim_mad <- vapply(seq_len(D), function(d) {
+      col_d <- whale_mat[, d]
+      mean(abs(col_d - median(col_d)))
+    }, numeric(1))
+    mean(dim_mad)
+  }
+
+  # ---- initialise WOA population --------------------------
+  if (verbose) message("[WOA] Initialising population (n = ", numPopulation, ") ...")
+
+  whale        <- generateRandom(numPopulation, numVar, lowerBound, upperBound)
+  whaleFitness <- apply(whale, 1, FUN)
+
+  idx          <- order(whaleFitness)
+  whaleFitness <- whaleFitness[idx]
+  whale        <- whale[idx, , drop = FALSE]
+
+  bestPos      <- whale[1, ]
+  FbestPos     <- whaleFitness[1]
+
+  # record initial diversity as baseline for threshold
+  init_diversity <- compute_diversity(whale)
+  trigger_level  <- div_threshold * init_diversity
+
+  if (verbose) message(
+    "[WOA] Initial best fitness : ", round(FbestPos, 6),
+    "\n[WOA] Initial diversity    : ", round(init_diversity, 6),
+    "\n[WOA] Diversity trigger at : ", round(trigger_level, 6)
+  )
+
+  # storage for history
+  woa_history <- data.frame(
+    iter      = integer(),
+    best_fit  = numeric(),
+    diversity = numeric()
+  )
+
+  trigger      <- "max_iter"
+  woa_iters    <- 0L
+
+  # ---- WOA main loop --------------------------------------
+  for (t in seq_len(max_iter_woa)) {
+
+    a  <- 2 - t * (2 / max_iter_woa)     # decreases 2 -> 0
+    a2 <- -1 + t * (-1 / max_iter_woa)   # decreases -1 -> -2
+
+    for (i in seq_len(nrow(whale))) {
+
+      r1 <- runif(1); r2 <- runif(1)
+      A  <- 2 * a * r1 - a
+      C  <- 2 * r2
+      b  <- 1
+      l  <- (a2 - 1) * runif(1) + 1
+      p  <- runif(1)
+
+      for (j in seq_len(ncol(whale))) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            # exploration: move toward random whale
+            rand_idx   <- floor(nrow(whale) * runif(1) + 1)
+            x_rand     <- whale[rand_idx, ]
+            D_rand     <- abs(C * x_rand[j] - whale[i, j])
+            whale[i, j] <- x_rand[j] - A * D_rand
+          } else {
+            # exploitation: shrinking encircling
+            D_best     <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D_best
+          }
+        } else {
+          # spiral update
+          dist_to_best <- abs(bestPos[j] - whale[i, j])
+          whale[i, j]  <- dist_to_best * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+
+      # enforce bounds
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+
+      # evaluate and update best
+      fit <- FUN(whale[i, ])
+      if (fit < FbestPos) {
+        FbestPos <- fit
+        bestPos  <- whale[i, ]
+      }
+    }
+
+    woa_iters  <- t
+    diversity  <- compute_diversity(whale)
+
+    woa_history <- rbind(woa_history, data.frame(
+      iter      = t,
+      best_fit  = FbestPos,
+      diversity = diversity
+    ))
+
+    if (verbose && t %% 25 == 0) {
+      message("[WOA] iter ", t, " | best = ", round(FbestPos, 6),
+              " | diversity = ", round(diversity, 6))
+    }
+
+    # --- diversity transition check -------------------------
+    if (diversity < trigger_level) {
+      trigger <- "diversity"
+      if (verbose) message(
+        "[WOA] Diversity trigger fired at iteration ", t,
+        " (diversity = ", round(diversity, 6), " < ",
+        round(trigger_level, 6), ")"
+      )
+      break
+    }
+  }
+
+  if (trigger == "max_iter" && verbose) {
+    message("[WOA] Max iteration cap reached (", max_iter_woa, " iters).")
+  }
+
+  # ---- select LMA seeds ------------------------------------
+  if (trigger == "diversity") {
+  
+    # Sort all whales by fitness and take top n_lma
+    final_fitness <- apply(whale, 1, FUN)
+    top_idx       <- order(final_fitness)[seq_len(min(n_lma, nrow(whale)))]
+    candidates    <- whale[top_idx, , drop = FALSE]
+  
+    if (verbose) message(
+      "\n[LMA] Selecting seeds from top ", nrow(candidates),
+      " whales ..."
+    )
+  
+    # ---- minimum distance filter -----------------------------
+    selected <- candidates[1, , drop = FALSE]
+  
+    if (nrow(candidates) > 1) {
+      for (k in 2:nrow(candidates)) {
+        candidate_k <- candidates[k, ]
+        dists_to_selected <- apply(selected, 1, function(s) {
+          sqrt(sum((candidate_k - s)^2))
+        })
+        if (all(dists_to_selected >= abs_min_dist)) {
+          selected <- rbind(selected, candidate_k)
+        } else {
+          if (verbose) message(
+            "[LMA] Seed ", k, " skipped (too close to an existing seed, ",
+            "min dist = ", round(min(dists_to_selected), 6), ")"
+          )
+        }
+      }
+    }
+  
+    rownames(selected) <- NULL
+  
+    if (verbose) message(
+      "[LMA] Running LMA from ", nrow(selected), " seed(s) ..."
+    )
+  
+    # ---- run LMA from each seed ------------------------------
+    lma_results  <- vector("list", nrow(selected))
+    lma_values   <- rep(Inf, nrow(selected))
+  
+    for (k in seq_len(nrow(selected))) {
+      seed_k <- as.numeric(selected[k, ])
+  
+      if (verbose) message(
+        "[LMA] Seed ", k, ": starting at (",
+        paste(round(seed_k, 4), collapse = ", "), ")"
+      )
+  
+      result_k <- tryCatch(
+        nls.lm(par = seed_k, fn = residual_fn, control = lm_control),
+        error = function(e) {
+          message("[LMA] Seed ", k, " errored: ", conditionMessage(e))
+          NULL
+        }
+      )
+  
+      lma_results[[k]] <- result_k
+  
+      if (!is.null(result_k)) {
+        val_k        <- FUN(result_k$par)
+        lma_values[k] <- val_k
+  
+        if (verbose) message(
+          "[LMA] Seed ", k, ": converged to (",
+          paste(round(result_k$par, 5), collapse = ", "),
+          ") | f = ", round(val_k, 8),
+          " | info = ", result_k$info,
+          if (result_k$info %in% c(1,2,3,4)) " [OK]" else " [!check convergence]"
+        )
+      }
+    }
+  
+    # ---- select best LMA result ------------------------------
+    best_lma_idx <- which.min(lma_values)
+    best_result  <- lma_results[[best_lma_idx]]
+  
+    if (is.null(best_result)) {
+      warning("[hybrid] All LMA runs failed. Returning WOA best position.")
+      final_par <- bestPos
+      final_val <- FbestPos
+    } else {
+      final_par <- best_result$par
+      final_val <- lma_values[best_lma_idx]
+    }
+    
+  } else {
+    # diversity threshold never met — return WOA best as-is
+    lma_results  <- NULL
+    best_lma_idx <- NULL
+    selected     <- NULL
+    final_par    <- bestPos
+    final_val    <- FbestPos
+    
+    if (verbose) message("[hybrid] Diversity threshold not met — returning WOA best.")
+  }
+  return(list(
+    par          = final_par,
+    value        = final_val,
+    woa_iters    = woa_iters,
+    trigger      = trigger,
+    lma_results  = lma_results,
+    lma_best_idx = best_lma_idx,
+    woa_history  = woa_history,
+    seeds_used   = selected
+  ))
+}
+
+```
+
+```{r}
+# ============================================================
+# EXAMPLE USAGE — Rastrigin function
+# ============================================================
+# Rastrigin: f(x,y) = 20 + x^2 - 10cos(2pi*x) + y^2 - 10cos(2pi*y)
+# Global minimum at (0, 0), f = 0.
+# No natural least-squares formulation, so we use the sqrt wrapper.
+
+rastrigin <- function(params) {
+  x <- params[1]; y <- params[2]
+  20 + x^2 - 10*cos(2*pi*x) + y^2 - 10*cos(2*pi*y)
+}
+
+set.seed(42)
+
+result_rastrigin <- woa_lma_hybrid(
+  FUN           = rastrigin,
+  residual_fn   = NULL,          # will use sqrt wrapper automatically
+  numVar        = 2,
+  rangeVar      = matrix(c(-5, 5, -5, 5), nrow = 2),
+  numPopulation = 40,
+  max_iter_woa  = 200,
+  div_threshold = 0.05,
+  n_lma         = 5,
+  min_dist      = 0.05,
+  verbose       = TRUE
+)
+
+
+# ============================================================
+# EXAMPLE USAGE — Rosenbrock function
+# ============================================================
+# Rosenbrock: f(x,y) = (1-x)^2 + 100*(y - x^2)^2
+# Global minimum at (1, 1), f = 0.
+# Natural residual formulation available — much better for LMA.
+
+rosenbrock <- function(params) {
+  x <- params[1]; y <- params[2]
+  (1 - x)^2 + 100*(y - x^2)^2
+}
+
+rosenbrock_residual <- function(params) {
+  x <- params[1]; y <- params[2]
+  c(1 - x, 10*(y - x^2))    # sum of squares = rosenbrock(params)
+}
+
+set.seed(42)
+
+result_rosenbrock <- woa_lma_hybrid(
+  FUN           = rosenbrock,
+  residual_fn   = rosenbrock_residual,
+  numVar        = 2,
+  rangeVar      = matrix(c(-2, 2, -0.5, 3), nrow = 2),
+  numPopulation = 40,
+  max_iter_woa  = 200,
+  div_threshold = 0.05,
+  n_lma         = 5,
+  min_dist      = 0.05,
+  verbose       = TRUE
+)
+```
+
+first, the rastrigin doesn't have a natural least squares formulation which is why the first one is funky, however the execution of the alg worked correctly.
+
+if we use the rosenbrock as an example, we see that it worked perfectly (though this is an easy problem). we note that woa found the right answer after 50 iterations but the diversity didn't collapse until 170. then (as was true in both problems) it only ran lma from one whale since the candidates were so close. Either this won't be an issue on harder problems or, i will have to toggle the min_dist = 0.05.
+
+
+# default woa
+
+```{r}
+run_woa_default_rastrigin <- function(seed, n_dim = 5, numPopulation = 200,
+                                       maxIter = 300) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA(
+    FUN           = rastrigin,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = rastrigin(result),
+    algorithm = "WOA",
+    !!!setNames(as.list(result), paste0("x", seq_along(result)))
+  )
+}
+
+run_woa_default_schwefel <- function(seed, n_dim = 5, numPopulation = 200,
+                                      maxIter = 300) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA(
+    FUN           = schwefel,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = schwefel(result),
+    algorithm = "WOA_default"
+  )
+}
+```
+
+
+# woa 75%
+
+This func only runs until woa has reached 25% of its og diversity
+
+```{r}
+run_woa_early_stop_rastrigin <- function(seed, n_dim = 5, numPopulation = 200,
+                                          maxIter = 300, div_threshold = 0.25) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  lowerBound <- bounds[1, ]
+  upperBound <- bounds[2, ]
+  
+  compute_diversity <- function(whale_mat) {
+    D       <- ncol(whale_mat)
+    dim_mad <- vapply(seq_len(D), function(d) {
+      col_d <- whale_mat[, d]
+      mean(abs(col_d - median(col_d)))
+    }, numeric(1))
+    mean(dim_mad)
+  }
+  
+  # initialize population
+  whale        <- generateRandom(numPopulation, n_dim, lowerBound, upperBound)
+  whaleFitness <- apply(whale, 1, rastrigin)
+  idx          <- order(whaleFitness)
+  whaleFitness <- whaleFitness[idx]
+  whale        <- whale[idx, , drop = FALSE]
+  bestPos      <- whale[1, ]
+  FbestPos     <- whaleFitness[1]
+  
+  init_diversity <- compute_diversity(whale)
+  trigger_level  <- div_threshold * init_diversity
+  
+  # standard WOA loop (no normalization, no levy) with diversity stopping
+  for (t in seq_len(maxIter)) {
+    a  <- 2 - t * (2 / maxIter)
+    a2 <- -1 + t * (-1 / maxIter)
+    
+    for (i in seq_len(nrow(whale))) {
+      r1 <- runif(1); r2 <- runif(1)
+      A  <- 2 * a * r1 - a
+      C  <- 2 * r2
+      b  <- 1
+      l  <- (a2 - 1) * runif(1) + 1
+      p  <- runif(1)
+      
+      for (j in seq_len(ncol(whale))) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand_idx    <- floor(nrow(whale) * runif(1) + 1)
+            x_rand      <- whale[rand_idx, ]
+            D_rand      <- abs(C * x_rand[j] - whale[i, j])
+            whale[i, j] <- x_rand[j] - A * D_rand
+          } else {
+            D_best      <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D_best
+          }
+        } else {
+          dist_to_best <- abs(bestPos[j] - whale[i, j])
+          whale[i, j]  <- dist_to_best * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+      
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      fit <- rastrigin(whale[i, ])
+      if (fit < FbestPos) {
+        FbestPos <- fit
+        bestPos  <- whale[i, ]
+      }
+    }
+    
+    # check diversity trigger
+    if (compute_diversity(whale) < trigger_level) break
+  }
+  
+  tibble(
+    seed      = seed,
+    value     = FbestPos,
+    algorithm = "WOA_early_stop"
+  )
+}
+```
+
+
+
+```{r}
+run_woa_early_stop_schwefel <- function(seed, n_dim = 5, numPopulation = 200,
+                                         maxIter = 300, div_threshold = 0.25) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  lowerBound <- bounds[1, ]
+  upperBound <- bounds[2, ]
+  
+  compute_diversity <- function(whale_mat) {
+    D       <- ncol(whale_mat)
+    dim_mad <- vapply(seq_len(D), function(d) {
+      col_d <- whale_mat[, d]
+      mean(abs(col_d - median(col_d)))
+    }, numeric(1))
+    mean(dim_mad)
+  }
+  
+  whale        <- generateRandom(numPopulation, n_dim, lowerBound, upperBound)
+  whaleFitness <- apply(whale, 1, schwefel)
+  idx          <- order(whaleFitness)
+  whaleFitness <- whaleFitness[idx]
+  whale        <- whale[idx, , drop = FALSE]
+  bestPos      <- whale[1, ]
+  FbestPos     <- whaleFitness[1]
+  
+  init_diversity <- compute_diversity(whale)
+  trigger_level  <- div_threshold * init_diversity
+  
+  for (t in seq_len(maxIter)) {
+    a  <- 2 - t * (2 / maxIter)
+    a2 <- -1 + t * (-1 / maxIter)
+    
+    for (i in seq_len(nrow(whale))) {
+      r1 <- runif(1); r2 <- runif(1)
+      A  <- 2 * a * r1 - a
+      C  <- 2 * r2
+      b  <- 1
+      l  <- (a2 - 1) * runif(1) + 1
+      p  <- runif(1)
+      
+      for (j in seq_len(ncol(whale))) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand_idx    <- floor(nrow(whale) * runif(1) + 1)
+            x_rand      <- whale[rand_idx, ]
+            D_rand      <- abs(C * x_rand[j] - whale[i, j])
+            whale[i, j] <- x_rand[j] - A * D_rand
+          } else {
+            D_best      <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D_best
+          }
+        } else {
+          dist_to_best <- abs(bestPos[j] - whale[i, j])
+          whale[i, j]  <- dist_to_best * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+      
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      fit <- schwefel(whale[i, ])
+      if (fit < FbestPos) {
+        FbestPos <- fit
+        bestPos  <- whale[i, ]
+      }
+    }
+    
+    if (compute_diversity(whale) < trigger_level) break
+  }
+  
+  tibble(
+    seed      = seed,
+    value     = FbestPos,
+    algorithm = "WOA_early_stop"
+  )
+}
+```
+
+
+
+
+
+# woa_levy_lma_hybrid
+
+```{r}
+woa_levy_lma_hybrid <- function(
+    FUN,
+    residual_fn   = NULL,
+    numVar,
+    rangeVar,
+    numPopulation = 40,
+    max_iter_woa  = 200,
+    div_threshold = 0.05,
+    n_lma         = 5,
+    min_dist      = 0.05,
+    beta          = 1.5,
+    lm_control    = nls.lm.control(maxiter = 500, ftol = 1e-12,
+                                    ptol = 1e-12),
+    verbose       = TRUE
+) {
+
+  # ---- input checks ----------------------------------------
+  n_lma <- min(max(n_lma, 1), 10)
+  stopifnot(nrow(rangeVar) == 2, ncol(rangeVar) == numVar)
+
+  lowerBound   <- rangeVar[1, ]
+  upperBound   <- rangeVar[2, ]
+  space_diam   <- sqrt(sum((upperBound - lowerBound)^2))
+  abs_min_dist <- min_dist * space_diam
+
+  # ---- generic residual wrapper if none provided -----------
+  if (is.null(residual_fn)) {
+    if (verbose) message(
+      "[hybrid] No residual_fn supplied — using sqrt(FUN) wrapper.\n",
+      "         For best LMA performance, supply a natural residual."
+    )
+    residual_fn <- function(params) sqrt(FUN(params) + 1e-10)
+  }
+
+  # ---- helper: population diversity ------------------------
+  compute_diversity <- function(whale_mat) {
+    D       <- ncol(whale_mat)
+    dim_mad <- vapply(seq_len(D), function(d) {
+      col_d <- whale_mat[, d]
+      mean(abs(col_d - median(col_d)))
+    }, numeric(1))
+    mean(dim_mad)
+  }
+
+  # ---- initialise WOA population --------------------------
+  if (verbose) message("[WOA] Initialising population (n = ", numPopulation, ") ...")
+
+  whale        <- generateRandom(numPopulation, numVar, lowerBound, upperBound)
+  whaleFitness <- apply(whale, 1, FUN)
+  idx          <- order(whaleFitness)
+  whaleFitness <- whaleFitness[idx]
+  whale        <- whale[idx, , drop = FALSE]
+  bestPos      <- whale[1, ]
+  FbestPos     <- whaleFitness[1]
+
+  init_diversity <- compute_diversity(whale)
+  trigger_level  <- div_threshold * init_diversity
+
+  if (verbose) message(
+    "[WOA] Initial best fitness : ", round(FbestPos, 6),
+    "\n[WOA] Initial diversity    : ", round(init_diversity, 6),
+    "\n[WOA] Diversity trigger at : ", round(trigger_level, 6)
+  )
+
+  woa_history <- data.frame(
+    iter      = integer(),
+    best_fit  = numeric(),
+    diversity = numeric()
+  )
+
+  trigger   <- "max_iter"
+  woa_iters <- 0L
+
+  # ---- WOA main loop (levy exploration + normalized steps) -
+  for (t in seq_len(max_iter_woa)) {
+
+    a  <- 2 - t * (2 / max_iter_woa)
+    a2 <- -1 + t * (-1 / max_iter_woa)
+
+    for (i in seq_len(nrow(whale))) {
+
+      r1 <- runif(1); r2 <- runif(1)
+      A  <- 2 * a * r1 - a
+      C  <- 2 * r2
+      b  <- 1
+      l  <- (a2 - 1) * runif(1) + 1
+      p  <- runif(1)
+
+      # normalize current whale and best position for step calculation
+      whale_i_norm     <- normalize_params(whale[i, ], rangeVar)
+      bestPos_norm     <- normalize_params(bestPos, rangeVar)
+      whale_i_norm_new <- whale_i_norm
+
+      for (j in seq_len(ncol(whale))) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            # levy exploration: jump toward random whale
+            # scaled by distance to that whale
+            rand_idx    <- floor(nrow(whale) * runif(1) + 1)
+            x_rand_norm <- normalize_params(whale[rand_idx, ], rangeVar)
+
+            s <- levy_step(n = 1, beta = beta)
+            whale_i_norm_new[j] <- x_rand_norm[j] + s * abs(x_rand_norm[j] - whale_i_norm[j])
+
+          } else {
+            # standard normalized exploitation (unchanged)
+            D.bestPos           <- abs(C * bestPos_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- bestPos_norm[j] - A * D.bestPos
+          }
+
+        } else {
+          # standard normalized spiral (unchanged)
+          distance            <- abs(bestPos_norm[j] - whale_i_norm[j])
+          whale_i_norm_new[j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos_norm[j]
+        }
+      }
+
+      # denormalize back to original space
+      whale[i, ] <- denormalize_params(whale_i_norm_new, rangeVar)
+
+      # check bounds in original space
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+
+      # evaluate fitness in original space
+      fit <- FUN(whale[i, ])
+      if (fit < FbestPos) {
+        FbestPos <- fit
+        bestPos  <- whale[i, ]
+      }
+    }
+
+    woa_iters <- t
+    diversity <- compute_diversity(whale)
+
+    woa_history <- rbind(woa_history, data.frame(
+      iter      = t,
+      best_fit  = FbestPos,
+      diversity = diversity
+    ))
+
+    if (verbose && t %% 25 == 0) {
+      message("[WOA] iter ", t, " | best = ", round(FbestPos, 6),
+              " | diversity = ", round(diversity, 6))
+    }
+
+    # --- diversity transition check -------------------------
+    if (diversity < trigger_level) {
+      trigger <- "diversity"
+      if (verbose) message(
+        "[WOA] Diversity trigger fired at iteration ", t,
+        " (diversity = ", round(diversity, 6), " < ",
+        round(trigger_level, 6), ")"
+      )
+      break
+    }
+  }
+
+  if (trigger == "max_iter" && verbose)
+    message("[WOA] Max iteration cap reached (", max_iter_woa, " iters).")
+
+  # ---- select LMA seeds ------------------------------------
+  final_fitness <- apply(whale, 1, FUN)
+  top_idx       <- order(final_fitness)[seq_len(min(n_lma, nrow(whale)))]
+  candidates    <- whale[top_idx, , drop = FALSE]
+
+  if (verbose) message(
+    "\n[LMA] Selecting seeds from top ", nrow(candidates), " whales ..."
+  )
+
+  # ---- minimum distance filter -----------------------------
+  selected <- candidates[1, , drop = FALSE]
+
+  if (nrow(candidates) > 1) {
+    for (k in 2:nrow(candidates)) {
+      candidate_k       <- candidates[k, ]
+      dists_to_selected <- apply(selected, 1, function(s) sqrt(sum((candidate_k - s)^2)))
+      if (all(dists_to_selected >= abs_min_dist)) {
+        selected <- rbind(selected, candidate_k)
+      } else {
+        if (verbose) message(
+          "[LMA] Seed ", k, " skipped (too close to an existing seed, ",
+          "min dist = ", round(min(dists_to_selected), 6), ")"
+        )
+      }
+    }
+  }
+
+  rownames(selected) <- NULL
+
+  if (verbose) message("[LMA] Running LMA from ", nrow(selected), " seed(s) ...")
+
+  # ---- run LMA from each seed ------------------------------
+  lma_results <- vector("list", nrow(selected))
+  lma_values  <- rep(Inf, nrow(selected))
+
+  for (k in seq_len(nrow(selected))) {
+    seed_k <- as.numeric(selected[k, ])
+
+    if (verbose) message(
+      "[LMA] Seed ", k, ": starting at (",
+      paste(round(seed_k, 4), collapse = ", "), ")"
+    )
+
+    result_k <- tryCatch(
+      nls.lm(par = seed_k, fn = residual_fn, control = lm_control),
+      error = function(e) {
+        message("[LMA] Seed ", k, " errored: ", conditionMessage(e))
+        NULL
+      }
+    )
+
+    lma_results[[k]] <- result_k
+
+    if (!is.null(result_k)) {
+      val_k         <- FUN(result_k$par)
+      lma_values[k] <- val_k
+
+      if (verbose) message(
+        "[LMA] Seed ", k, ": converged to (",
+        paste(round(result_k$par, 5), collapse = ", "),
+        ") | f = ", round(val_k, 8),
+        " | info = ", result_k$info,
+        if (result_k$info %in% c(1,2,3,4)) " [OK]" else " [!check convergence]"
+      )
+    }
+  }
+
+  # ---- select best LMA result ------------------------------
+  best_lma_idx <- which.min(lma_values)
+  best_result  <- lma_results[[best_lma_idx]]
+
+  if (is.null(best_result)) {
+    warning("[hybrid] All LMA runs failed. Returning WOA best position.")
+    final_par <- bestPos
+    final_val <- FbestPos
+  } else {
+    final_par <- best_result$par
+    final_val <- lma_values[best_lma_idx]
+  }
+
+  if (verbose) message(
+    "\n[hybrid] DONE",
+    "\n  WOA trigger  : ", trigger, " (at iter ", woa_iters, ")",
+    "\n  LMA winner   : seed ", best_lma_idx,
+    "\n  Final params : (", paste(round(final_par, 6), collapse = ", "), ")",
+    "\n  Final f      : ", round(final_val, 10)
+  )
+
+  return(list(
+    par          = final_par,
+    value        = final_val,
+    woa_iters    = woa_iters,
+    trigger      = trigger,
+    lma_results  = lma_results,
+    lma_best_idx = best_lma_idx,
+    woa_history  = woa_history,
+    seeds_used   = selected
+  ))
+}
+```
+
+
+
+# Schweffel
+
+```{r}
+
+# schwefel
+
+schwefel <- function(x) {
+  n   <- length(x)
+  val <- 418.9829 * n - sum(x * sin(sqrt(abs(x))))
+  val
+}
+
+
+# schwefel_residual <- function(x) {
+#   418.9829 - x * sin(sqrt(abs(x)))
+# }
+
+# schwefel_residual <- function(x) {
+#   eps <- 1e-8
+#   418.9829 - x * sin(sqrt(abs(x) + eps))
+# }
+
+schwefel_residual <- function(x) {
+  sqrt(pmax(418.9829 - x * sin(sqrt(abs(x))), 0))
+}
+
+run_schwefel_benchmark <- function(n_dim = 5, seed = 42) {
+  set.seed(seed)
+  message("\n", strrep("=", 60))
+  message("SCHWEFEL BENCHMARK  (", n_dim, "D)")
+  message("Known global minimum: f = 0  at  x_i = 420.9687 for all i")
+  message(strrep("=", 60))
+
+  bounds_schwefel <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+
+  result <- woa_lma_hybrid(
+    FUN         = schwefel,
+    residual_fn = schwefel_residual,
+    numVar      = n_dim,
+    rangeVar    = bounds_schwefel,
+    numPopulation = 200,
+    max_iter_woa  = 300,
+    div_threshold = 0.5,
+    n_lma         = 10,
+    min_dist      = 0.05,
+    verbose       = TRUE
+  )
+
+  message("\n--- SCHWEFEL RESULTS ---")
+  message("Best parameter values : ", paste(round(result$par, 4), collapse = ", "))
+  message("Known optimum values  : ", paste(rep(420.9687, n_dim), collapse = ", "))
+  message("Error per dimension   : ", paste(round(abs(result$par - 420.9687), 4), collapse = ", "))
+  message("Final f(x)            : ", round(result$value, 8), "  (target = 0)")
+  message("WOA iters used        : ", result$woa_iters, " (trigger: ", result$trigger, ")")
+
+  invisible(result)
+}
+
+```
+
+
+# Phase retrieval
+
+```{r}
+# ============================================================
+# BENCHMARK 2: PHASE RETRIEVAL
+# ============================================================
+# Goal: recover a real signal x from its Fourier magnitude |F(x)|.
+# The phase is lost — only |F(x)|^2 (power spectrum) is observed.
+#
+# Setup:
+#   - True signal: a 1D Gaussian pulse on N = 16 points
+#   - Observed data: |FFT(x_true)|^2  (magnitude squared, no phase)
+#   - Parameters to recover: the N real signal values directly
+#
+# Objective (SSE in Fourier magnitude):
+#   f(x) = sum_k ( |FFT(x)_k| - |FFT(x_true)_k| )^2
+#
+# Notes:
+#   - The problem has trivial ambiguities (shift, reflection, conjugate flip)
+#     so we look at the *magnitude spectrum* match, not parameter identity.
+#   - Global minimum is 0 when magnitudes match exactly.
+#   - LMA residuals: r_k = |FFT(x)_k| - |FFT(x_true)_k|
+# ============================================================
+
+make_phase_retrieval_problem <- function(N = 16, seed = 7) {
+  set.seed(seed)
+
+  # True signal: Gaussian pulse centred at N/2
+  t_grid  <- seq_len(N)
+  x_true  <- exp(-0.5 * ((t_grid - N/2) / (N/8))^2)
+
+  # Observed Fourier magnitudes (what we know)
+  fft_true     <- fft(x_true)
+  obs_mag      <- Mod(fft_true)          # |F(x_true)|
+  obs_mag_sq   <- obs_mag^2             # power spectrum (for reference)
+
+  list(
+    x_true   = x_true,
+    obs_mag  = obs_mag,
+    N        = N
+  )
+}
+
+phase_retrieval_objective <- function(x, obs_mag) {
+  fft_x   <- fft(x)
+  rec_mag <- Mod(fft_x)
+  sum((rec_mag - obs_mag)^2)
+}
+
+phase_retrieval_residuals <- function(x, obs_mag) {
+  fft_x   <- fft(x)
+  rec_mag <- Mod(fft_x)
+  rec_mag - obs_mag   # vector of residuals, one per frequency bin
+}
+
+run_phase_retrieval_benchmark <- function(N = 16, seed = 42) {
+  set.seed(seed)
+  message("\n", strrep("=", 60))
+  message("PHASE RETRIEVAL BENCHMARK  (N = ", N, " signal points)")
+  message("Recover a 1D Gaussian signal from its Fourier magnitudes")
+  message(strrep("=", 60))
+
+  prob <- make_phase_retrieval_problem(N = N, seed = 7)
+
+  # Bounds: signal values assumed in [-2, 2] (true signal is in [0,1])
+  bounds_pr <- matrix(
+    c(rep(-2, N), rep(2, N)),
+    nrow = 2, byrow = TRUE
+  )
+
+  obj_fn  <- function(x) phase_retrieval_objective(x, prob$obs_mag)
+  res_fn  <- function(x) phase_retrieval_residuals(x, prob$obs_mag)
+
+  result <- woa_lma_hybrid(
+    FUN           = obj_fn,
+    residual_fn   = res_fn,
+    numVar        = N,
+    rangeVar      = bounds_pr,
+    numPopulation = 60,
+    max_iter_woa  = 300,
+    div_threshold = 0.05,
+    n_lma         = 5,
+    min_dist      = 0.02,
+    verbose       = TRUE
+  )
+
+  # Evaluate quality: compare recovered Fourier magnitudes to observed
+  rec_mag  <- Mod(fft(result$par))
+  mag_err  <- sqrt(mean((rec_mag - prob$obs_mag)^2))   # RMSE in magnitude
+
+  message("\n--- PHASE RETRIEVAL RESULTS ---")
+  message("Final f(x) (SSE in magnitude) : ", round(result$value, 8), "  (target = 0)")
+  message("RMSE in Fourier magnitude     : ", round(mag_err, 8))
+  message("WOA iters used                : ", result$woa_iters,
+          " (trigger: ", result$trigger, ")")
+
+  # Diagnostic: correlation between recovered and true signal
+  # (accounts for the shift/reflection ambiguity)
+  cor_val <- max(abs(cor(result$par, prob$x_true)),
+                 abs(cor(rev(result$par), prob$x_true)))
+  message("Max |correlation| with true signal (shift-invariant): ", round(cor_val, 6))
+
+  invisible(list(result = result, problem = prob, mag_rmse = mag_err))
+}
+
+```
+
+```{r}
+# run both benchmarks
+
+# Schwefel (5D) 
+tic()
+schwefel_result <- run_schwefel_benchmark(n_dim = 5, seed = 42)
+toc()
+# convergence plot
+
+# plot(schwefel_result$woa_history$iter,
+#      schwefel_result$woa_history$best_fit,
+#      type = "l", col = "steelblue", lwd = 2,
+#      xlab = "WOA Iteration", ylab = "Best Fitness",
+#      main = "Schwefel (5D) — WOA convergence")
+# abline(h = 0, col = "red", lty = 2)
+
+```
+
+```{r}
+
+# Phase Retrieval (16-point signal) 
+pr_result <- run_phase_retrieval_benchmark(N = 16, seed = 42)
+
+# convergence plot
+
+# plot(pr_result$result$woa_history$iter,
+#      pr_result$result$woa_history$best_fit,
+#      type = "l", col = "darkorange", lwd = 2,
+#      xlab = "WOA Iteration", ylab = "Best Fitness (SSE)",
+#      main = "Phase Retrieval (16pt) — WOA convergence")
+# abline(h = 0, col = "red", lty = 2)
+#
+```
+
+# levy woa proper
+
+this is a proper levy with z score steps just to see if it works better
+
+```{r}
+# WOA with Normalized Steps + Levy Flight Exploration
+
+
+levy_step <- function(n = 1, beta = 1.5) {
+  sigma_u <- (gamma(1 + beta) * sin(pi * beta / 2) /
+               (gamma((1 + beta) / 2) * beta * 2^((beta - 1) / 2)))^(1 / beta)
+  u <- rnorm(n, mean = 0, sd = sigma_u)
+  v <- rnorm(n, mean = 0, sd = 1)
+  s <- u / abs(v)^(1 / beta)
+  return(s)
+}
+
+engineWOA_normalized_levy <- function(FUN, optimType, maxIter, lowerBound, upperBound,
+                                      whale, bounds_original, beta = 1.5) {
+  
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index        <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale        <- whale[index, ]
+  bestPos      <- whale[1, ]
+  FbestPos     <- whaleFitness[1]
+  curve        <- c()
+  progressbar  <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  
+  for (t in 1:maxIter) {
+    a  <- 2 - t * (2 / maxIter)
+    a2 <- -1 + t * (-1 / maxIter)
+    
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A  <- 2 * a * r1 - a
+      C  <- 2 * r2
+      b  <- 1
+      l  <- (a2 - 1) * runif(1) + 1
+      p  <- runif(1)
+      
+      # normalize current whale and best position for step calculation
+      whale_i_norm     <- normalize_params(whale[i, ], bounds_original)
+      bestPos_norm     <- normalize_params(bestPos, bounds_original)
+      whale_i_norm_new <- whale_i_norm
+      
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            # --- LEVY EXPLORATION ---
+            # replaces standard random-whale step with levy-scaled jump
+            # toward a random whale, scaled by distance to that whale.
+            # occasional large levy steps help escape boundary traps.
+            rand.index  <- floor(nrow(whale) * runif(1) + 1)
+            x_rand_norm <- normalize_params(whale[rand.index, ], bounds_original)
+            
+            s <- levy_step(n = 1, beta = beta)
+            whale_i_norm_new[j] <- x_rand_norm[j] + s * abs(x_rand_norm[j] - whale_i_norm[j])
+            
+          } else if (abs(A) < 1) {
+            # standard normalized exploitation (unchanged)
+            D.bestPos           <- abs(C * bestPos_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- bestPos_norm[j] - A * D.bestPos
+          }
+          
+        } else if (p >= 0.5) {
+          # standard normalized spiral (unchanged)
+          distance            <- abs(bestPos_norm[j] - whale_i_norm[j])
+          whale_i_norm_new[j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos_norm[j]
+        }
+      }
+      
+      # denormalize back to original space
+      whale[i, ] <- denormalize_params(whale_i_norm_new, bounds_original)
+      
+      # check bounds in original space
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      # evaluate fitness in original space
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos  <- whale[i, ]
+      }
+    }
+    
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+
+WOA_normalized_levy <- function(FUN, optimType = "MIN", numVar, numPopulation = 40,
+                                 maxIter = 500, rangeVar, beta = 1.5) {
+  
+  dimension <- ncol(rangeVar)
+  if (dimension == 1) dimension <- numVar
+  if (optimType == "MAX") optimType <- -1 else optimType <- 1
+  
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  
+  whale <- generateRandom(numPopulation, dimension, lowerBound, upperBound)
+  
+  bestPos <- engineWOA_normalized_levy(FUN, optimType, maxIter, lowerBound,
+                                       upperBound, whale, rangeVar, beta)
+  return(bestPos)
+}
+
+# schwefel runner for comparison
+run_woa_levy_schwefel <- function(seed, n_dim = 5, numPopulation = 40,
+                                   maxIter = 500, beta = 1.5) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA_normalized_levy(
+    FUN           = schwefel,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds,
+    beta          = beta
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = schwefel(result),
+    algorithm = "WOA_levy"
+  )
+}
+
+```
+
+
+
+
+# Compare to regular woa and lma
+
+```{r}
+# reminder: global min = 0 at x_i = 420.9687 for all i
+# bounds for all are [-500, 500]
+
+schwefel <- function(x) {
+  n <- length(x)
+  418.9829 * n - sum(x * sin(sqrt(abs(x))))
+}
+
+# schwefel_residual <- function(x) sqrt(schwefel(x) + 1e-10)
+
+# z score woa
+run_woa_schwefel <- function(seed, n_dim = 5, numPopulation = 40, maxIter = 500) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA_normalized_steps(
+    FUN           = schwefel,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = schwefel(result),
+    algorithm = "WOA_normalized"
+  )
+}
+
+# lma (w random starts like sicegar)
+run_lma_schwefel <- function(seed, n_dim = 5,
+                              max_success = 20, max_attempts = 500) {
+  set.seed(seed)
+  
+  lowerbounds <- rep(-500, n_dim)
+  upperbounds <- rep( 500, n_dim)
+  
+  fits       <- list()
+  sse_values <- c()
+  attempts   <- 0
+  
+  while (length(fits) < max_success && attempts < max_attempts) {
+    attempts <- attempts + 1
+    
+    start <- runif(n_dim, min = lowerbounds, max = upperbounds)
+    
+    res <- tryCatch(
+      nls.lm(
+        par     = start,
+        fn      = schwefel_residual,
+        control = nls.lm.control(maxiter = 1000, ptol = 1e-8, ftol = 1e-8)
+      ),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(res)) {
+      val <- schwefel(res$par)
+      fits[[length(fits) + 1]] <- res$par
+      sse_values <- c(sse_values, val)
+    }
+  }
+  
+  if (length(fits) == 0) {
+    return(tibble(seed = seed, value = NA, algorithm = "LMA_random"))
+  }
+  
+  best_idx <- which.min(sse_values)
+  
+  tibble(
+    seed      = seed,
+    value     = sse_values[best_idx],
+    algorithm = "LMA_random"
+  )
+}
+
+# woa-lma hybrid
+run_hybrid_schwefel <- function(seed, n_dim = 5, numPopulation = 300,
+                                 max_iter_woa = 500) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- woa_lma_hybrid(
+    FUN           = schwefel,
+    residual_fn   = schwefel_residual,
+    numVar        = n_dim,
+    rangeVar      = bounds,
+    numPopulation = numPopulation,
+    max_iter_woa  = max_iter_woa,
+    div_threshold = 0.25,
+    n_lma         = 10,
+    min_dist      = 0.05,
+    verbose       = FALSE
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = result$value,
+    algorithm = "WOA_LMA_hybrid"
+  )
+}
+
+# woa-levy-lma hybrid
+run_levy_hybrid_schwefel <- function(seed, n_dim = 5, numPopulation = 300,
+                                 max_iter_woa = 500) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-500, n_dim), rep(500, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- woa_levy_lma_hybrid(
+    FUN           = schwefel,
+    residual_fn   = schwefel_residual,
+    numVar        = n_dim,
+    rangeVar      = bounds,
+    numPopulation = numPopulation,
+    max_iter_woa  = max_iter_woa,
+    div_threshold = 0.25,
+    n_lma         = 10,
+    min_dist      = 0.05,
+    beta          = 1.5,
+    verbose       = FALSE
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = result$value,
+    algorithm = "WOA_Levy_LMA_hybrid"
+  )
+}
+
+
+# running comparison
+library(tictoc)
+
+seeds <- 1
+
+tic("WOA normalized")
+woa_results <- purrr::map_dfr(seeds, run_woa_schwefel, numPopulation = 300, maxIter = 300)
+toc()
+
+tic("LMA random")
+lma_results <- purrr::map_dfr(seeds, run_lma_schwefel, max_success = 20, max_attempts = 500)
+toc()
+
+tic("WOA-LMA hybrid")
+hybrid_results <- purrr::map_dfr(seeds, run_hybrid_schwefel, numPopulation = 300, max_iter_woa = 300)
+toc()
+
+tic("WOA levy")
+levy_results  <- purrr::map_dfr(seeds, run_woa_levy_schwefel, numPopulation = 300, maxIter = 300, beta = 1.5)
+toc()
+
+tic("WOA-levy-LMA hybrid")
+levy_hybrid_results <- purrr::map_dfr(seeds, run_levy_hybrid_schwefel, numPopulation = 300, max_iter_woa = 300)
+toc()
+
+results <- bind_rows(woa_results, levy_results, lma_results, hybrid_results, levy_hybrid_results)
+
+
+# summary
+epsilon <- 0.01
+
+results |>
+  group_by(algorithm) |>
+  summarise(
+    mean_value   = mean(value,  na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    min_value    = min(value,   na.rm = TRUE),
+    max_value    = max(value,   na.rm = TRUE),
+    n_failed     = sum(is.na(value)),
+    n_epsilon    = sum(value < epsilon, na.rm = TRUE)
+  )
+```
+
+First, it's worth noting that even with multiple random starts, some spots on the surface were not favorable (didn't play nicely with derivatives) and caused lma to fail. That said, LMA ran with 20 random starts and it's best value is 642 while WOA and the hybrid have values 0.00x.. We then note that the mean value and the minimum value for both WOA and the hybrid are very similar, however, the hybrid takes about half as much time to run (12.3 seconds vs 21.8 @ 200 search agents). Then it gets worse at 300 search agents??? 
+
+
+mean val @ 700 population is 148
+mean val @ 1000 population is 100
+mean val @ 2500 population is 100
+
+# rastrigin
+
+Compare all algorithms: Rastrigin function (5D)
+Global minimum: f = 0 at x_i = 0 for all i
+Domain: x_i in [-5.12, 5.12]
+
+```{r}
+rastrigin <- function(x) {
+  n <- length(x)
+  10 * n + sum(x^2 - 10 * cos(2 * pi * x))
+}
+
+# rastrigin_residual <- function(theta) {
+#   A <- 10
+#   theta^2 - A * cos(2 * pi * theta) + A
+# }
+
+rastrigin_residual <- function(theta) {
+  sqrt(pmax(theta^2 - 10 * cos(2 * pi * theta) + 10, 0))
+}
+
+# normalized woa for rastrigin
+
+run_woa_rastrigin <- function(seed, n_dim = 5, numPopulation = 40, maxIter = 500) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA_normalized_steps(
+    FUN           = rastrigin,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = rastrigin(result),
+    algorithm = "WOA_normalized"
+  )
+}
+
+
+# woa levy for rastrigin
+
+run_woa_levy_rastrigin <- function(seed, n_dim = 5, numPopulation = 40,
+                                    maxIter = 500, beta = 1.5) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- WOA_normalized_levy(
+    FUN           = rastrigin,
+    optimType     = "MIN",
+    numVar        = n_dim,
+    numPopulation = numPopulation,
+    maxIter       = maxIter,
+    rangeVar      = bounds,
+    beta          = beta
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = rastrigin(result),
+    algorithm = "WOA Lévy",
+    !!!setNames(as.list(result), paste0("x", seq_along(result)))
+  )
+}
+
+# lma for rastrigin
+run_lma_rastrigin <- function(seed, n_dim = 5,
+                               max_success = 20, max_attempts = 500) {
+  set.seed(seed)
+  
+  lowerbounds <- rep(-5.12, n_dim)
+  upperbounds <- rep( 5.12, n_dim)
+  
+  fits       <- list()
+  sse_values <- c()
+  attempts   <- 0
+  
+  while (length(fits) < max_success && attempts < max_attempts) {
+    attempts <- attempts + 1
+    
+    start <- runif(n_dim, min = lowerbounds, max = upperbounds)
+    
+    res <- tryCatch(
+      nls.lm(
+        par     = start,
+        fn      = rastrigin_residual,
+        control = nls.lm.control(maxiter = 1000, ptol = 1e-8, ftol = 1e-8)
+      ),
+      error = function(e) NULL
+    )
+    
+    if (!is.null(res)) {
+      val <- rastrigin(res$par)
+      fits[[length(fits) + 1]] <- res$par
+      sse_values <- c(sse_values, val)
+    }
+  }
+  
+  if (length(fits) == 0) {
+    return(tibble(
+      seed      = seed,
+      value     = NA,
+      algorithm = "LMA with random starts",
+      !!!setNames(as.list(rep(NA_real_, n_dim)), paste0("x", seq_len(n_dim)))
+    ))
+  }
+  
+  best_idx  <- which.min(sse_values)
+  best_par  <- fits[[best_idx]]
+  
+  tibble(
+    seed      = seed,
+    value     = sse_values[best_idx],
+    algorithm = "LMA with random starts",
+    !!!setNames(as.list(best_par), paste0("x", seq_along(best_par)))
+  )
+}
+
+
+# woa-lma hybrid for rastrigin
+
+run_hybrid_rastrigin <- function(seed, n_dim = 5, numPopulation = 200,
+                                  max_iter_woa = 300) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- woa_lma_hybrid(
+    FUN           = rastrigin,
+    residual_fn   = rastrigin_residual,
+    numVar        = n_dim,
+    rangeVar      = bounds,
+    numPopulation = numPopulation,
+    max_iter_woa  = max_iter_woa,
+    div_threshold = 0.05,
+    n_lma         = 10,
+    min_dist      = 0.01,
+    verbose       = FALSE
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = result$value,
+    algorithm = "WOA-LMA Hybrid",
+    !!!setNames(as.list(result$par), paste0("x", seq_along(result$par)))
+  )
+}
+```
+
+```{r}
+# add levy-lma hybrid runner
+run_levy_hybrid_rastrigin <- function(seed, n_dim = 5, numPopulation = 200,
+                                       max_iter_woa = 300) {
+  set.seed(seed)
+  
+  bounds <- matrix(
+    c(rep(-5.12, n_dim), rep(5.12, n_dim)),
+    nrow = 2, byrow = TRUE
+  )
+  
+  result <- woa_levy_lma_hybrid(
+    FUN           = rastrigin,
+    residual_fn   = rastrigin_residual,
+    numVar        = n_dim,
+    rangeVar      = bounds,
+    numPopulation = numPopulation,
+    max_iter_woa  = max_iter_woa,
+    div_threshold = 0.25,
+    n_lma         = 10,
+    min_dist      = 0.05,
+    beta          = 1.5,
+    verbose       = FALSE
+  )
+  
+  tibble(
+    seed      = seed,
+    value     = result$value,
+    algorithm = "WOA_levy_LMA_hybrid"
+  )
+}
+
+# running it all
+seeds <- 21:40
+
+# tic("WOA normalized")
+# woa_results          <- purrr::map_dfr(seeds, run_woa_rastrigin,
+#                                         numPopulation = 350, maxIter = 300)
+# toc()
+
+tic("WOA Lévy")
+levy_results         <- purrr::map_dfr(seeds, run_woa_levy_rastrigin,
+                                        numPopulation = 350, maxIter = 300, beta = 1.5)
+toc()
+
+tic("LMA with random starts")
+lma_results          <- purrr::map_dfr(seeds, run_lma_rastrigin,
+                                        max_success = 20, max_attempts = 500)
+toc()
+
+tic("WOA-LMA Hybrid")
+hybrid_results       <- purrr::map_dfr(seeds, run_hybrid_rastrigin,
+                                        numPopulation = 350, max_iter_woa = 300)
+toc()
+
+# tic("WOA-levy-LMA hybrid")
+# levy_hybrid_results  <- purrr::map_dfr(seeds, run_levy_hybrid_rastrigin,
+#                                         numPopulation = 350, max_iter_woa = 300)
+# toc()
+
+results <- bind_rows(woa_results, levy_results, lma_results,
+                     hybrid_results, levy_hybrid_results)
+
+# summary
+epsilon <- 0.01
+
+results |>
+  group_by(algorithm) |>
+  summarise(
+    mean_value   = mean(value,   na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    min_value    = min(value,    na.rm = TRUE),
+    max_value    = max(value,    na.rm = TRUE),
+    n_failed     = sum(is.na(value)),
+    n_epsilon    = sum(value < epsilon, na.rm = TRUE)
+  )
+```
+
+
+
+
+# dataframes
+
+I want to make big dataframes to look at:
+```{r}
+# rastrigin
+
+tic.clearlog()  # reset log
+
+# running it all
+seeds <- 1:200
+
+# tic("WOA normalized")
+# woa_norm_results_rast <- purrr::map_dfr(seeds, run_woa_rastrigin,
+#                                         numPopulation = 300, maxIter = 300)
+# toc()
+
+tic("WOA Lévy")
+levy_results_rast <- purrr::map_dfr(seeds, run_woa_levy_rastrigin,
+                                        numPopulation = 300, maxIter = 300, beta = 1.5)
+toc(log = TRUE, quiet = TRUE)
+
+tic("LMA with random starts")
+lma_results_rast  <- purrr::map_dfr(seeds, run_lma_rastrigin,
+                                        max_success = 20, max_attempts = 500)
+toc(log = TRUE, quiet = TRUE)
+
+tic("WOA-LMA Hybrid")
+hybrid_results_rast <- purrr::map_dfr(seeds, run_hybrid_rastrigin,
+                                        numPopulation = 300, max_iter_woa = 300)
+toc(log = TRUE, quiet = TRUE)
+
+# tic("WOA 75%")
+# early_stop_results_rast <- purrr::map_dfr(seeds, run_woa_early_stop_rastrigin,
+#                                         numPopulation = 300, maxIter = 300)
+# toc()
+
+# tic("WOA-levy-LMA hybrid")
+# levy_hybrid_results_rast  <- purrr::map_dfr(seeds, run_levy_hybrid_rastrigin,
+#                                         numPopulation = 300, max_iter_woa = 300)
+# toc()
+
+tic("WOA")
+woa_default_results_rast <- purrr::map_dfr(seeds, run_woa_default_rastrigin, numPopulation = 300, maxIter = 300)
+toc(log = TRUE, quiet = TRUE)
+
+results_rast <- bind_rows(levy_results_rast, lma_results_rast,
+                     hybrid_results_rast, woa_default_results_rast) |>
+  mutate(l2_norm = sqrt(rowSums(across(starts_with("x"), ~ .x^2), na.rm = TRUE)))
+
+# computation time table
+timing_rast <- tic.log(format = FALSE) |>
+  map_dfr(~ tibble(
+    algorithm = .x$msg,
+    time_sec  = .x$toc - .x$tic
+  ))
+
+
+# summary
+epsilon <- 0.01
+all_algs_rastrigin_df <- results_rast |>
+  group_by(algorithm) |>
+  summarise(
+    mean_obj_value   = mean(value,   na.rm = TRUE),
+    median_obj_value = median(value, na.rm = TRUE),
+    min_obj_value    = min(value,    na.rm = TRUE),
+    max_obj_value    = max(value,    na.rm = TRUE),
+    n_failed     = sum(is.na(value)),
+    n_under_0.1    = sum(value < epsilon, na.rm = TRUE),
+    mean_param_acc      = mean(l2_norm, na.rm = TRUE),
+    median_param_acc    = median(l2_norm, na.rm = TRUE),
+    min_param_acc       = min(l2_norm, na.rm = TRUE),
+    max_param_acc       = max(l2_norm, na.rm = TRUE))
+
+```
+
+```{r}
+# computation time per seed
+time_per_seed <- timing_rast |>
+  mutate(time_sec = time_sec/200) 
+
+colnames(time_per_seed) <- c("Algorithm", "Time (sec)")
+```
+
+
+
+```{r}
+# define colors
+algo_colors <- c(
+  "LMA with random starts" = "#2166AC",
+  "WOA Lévy"              = "#F98E2B",
+  "WOA-LMA Hybrid"        = "#74C8C0",
+  "WOA"                   = "#D6191B"
+)
+
+# plot 1 - all algorithms
+params_accuracy_plot_df |>
+  ggplot(aes(x = seed, y = l2_norm)) +
+  geom_point(aes(color = algorithm)) +
+  geom_line(aes(color = algorithm), alpha = 0.5) +
+  scale_color_manual(values = algo_colors) +
+  theme_minimal() +
+  labs(x = "Seed", y = "Accuracy of Parameter Estimation",
+       title = "Accuracy of Parameter Estimates Across Algorithms")
+
+# plot 2 - woa vs hybrid
+params_accuracy_plot_df |>
+  filter(algorithm %in% c("WOA", "WOA-LMA Hybrid")) |>
+  ggplot(aes(x = seed, y = l2_norm)) +
+  geom_point(aes(color = algorithm)) +
+  geom_line(aes(color = algorithm), alpha = 0.5) +
+  scale_color_manual(values = algo_colors) +
+  theme_minimal() +
+  labs(x = "Seed", y = "Accuracy of Parameter Estimation",
+       title = "Accuracy of Parameter Estimates Between WOA & WOA-LMA Hybrid")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+# schwefel
+tic("WOA normalized")
+woa_norm_results_schwef <- purrr::map_dfr(seeds, run_woa_schwefel, numPopulation = 300, maxIter = 300)
+toc()
+
+tic("LMA random")
+lma_results_schwef <- purrr::map_dfr(seeds, run_lma_schwefel, max_success = 20, max_attempts = 500)
+toc()
+
+tic("WOA-LMA hybrid")
+hybrid_results_schwef <- purrr::map_dfr(seeds, run_hybrid_schwefel, numPopulation = 300, max_iter_woa = 300)
+toc()
+
+tic("WOA 75%")
+early_stop_results_schwef <- purrr::map_dfr(seeds, run_woa_early_stop_schwefel,
+                                        numPopulation = 300, maxIter = 300)
+toc()
+
+tic("WOA levy")
+levy_results_schwef  <- purrr::map_dfr(seeds, run_woa_levy_schwefel, numPopulation = 300, maxIter = 300, beta = 1.5)
+toc()
+
+tic("WOA-levy-LMA hybrid")
+levy_hybrid_results_schwef <- purrr::map_dfr(seeds, run_levy_hybrid_schwefel, numPopulation = 300, max_iter_woa = 300)
+toc()
+
+tic("WOA")
+woa_default_results_schwef <- purrr::map_dfr(seeds, run_woa_default_schwefel, numPopulation = 300, maxIter = 300)
+toc()
+
+results_schwef <- bind_rows(woa_norm_results_schwef, levy_results_schwef, lma_results_schwef, hybrid_results_schwef, early_stop_results_schwef, levy_hybrid_results_schwef, woa_default_results_schwef)
+
+
+# summary
+epsilon <- 0.01
+
+all_algs_schwefel_df <- results_schwef |>
+  group_by(algorithm) |>
+  summarise(
+    mean_value   = mean(value,  na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    min_value    = min(value,   na.rm = TRUE),
+    max_value    = max(value,   na.rm = TRUE),
+    n_failed     = sum(is.na(value)),
+    n_epsilon    = sum(value < epsilon, na.rm = TRUE))
+```
+
+Run 2:
+Rastrigin:
+WOA normalized: 317.892 sec elapsed
+WOA levy: 378.848 sec elapsed
+LMA random: 0.575 sec elapsed
+WOA-LMA hybrid: 27.398 sec elapsed
+WOA-levy-LMA hybrid: 236.265 sec elapsed
+WOA: 537.614 sec elapsed
+
+Schwefel: - computer def fell asleep during some of these
+WOA normalized: 337.571 sec elapsed
+LMA random: 0.353 sec elapsed
+WOA-LMA hybrid: 94.292 sec elapsed
+WOA levy: 599.663 sec elapsed
+WOA-levy-LMA hybrid: 5636.39 sec elapsed
+WOA: 596.52 sec elapsed
+
+Run 3:
+Rastrigin:
+WOA normalized: 361.323 sec elapsed
+WOA levy: 349.316 sec elapsed
+LMA random: 0.317 sec elapsed
+WOA-LMA hybrid: 27.385 sec elapsed
+WOA-levy-LMA hybrid: 230.005 sec elapsed
+WOA: 185.525 sec elapsed
+
+Schwefel:
+WOA normalized: 297.028 sec elapsed
+LMA random: 0.355 sec elapsed
+WOA-LMA hybrid: 93.471 sec elapsed
+WOA levy: 396.831 sec elapsed
+WOA-levy-LMA hybrid: 143.09 sec elapsed
+WOA: 226.48 sec elapsed
+
+
+I want to check rastrigin results:
+
+```{r}
+# are the results actually zero?
+woa_default_results_rast |> 
+  summarise(exact_zeros = sum(value == 0))
+
+# check vals
+woa_default_results_rast |> pull(value) |> round(6)
+
+```
+
+
+
+```{r}
+# check to see if there is an internal rastrigin
+metaheuristicOpt:::rastrigin
+
+```
+There is!
+Here's mine; they're the same:
+
+function(x) {
+  n <- length(x)
+  10 * n + sum(x^2 - 10 * cos(2 * pi * x))
+}
+
+
+```{r}
+# double check the result
+set.seed(1)
+bounds <- matrix(c(rep(-5.12, 5), rep(5.12, 5)), nrow = 2, byrow = TRUE)
+result <- WOA(FUN = rastrigin, optimType = "MIN", numVar = 5,
+              numPopulation = 300, maxIter = 300, rangeVar = bounds)
+result
+rastrigin(result)
+```
+It is indeed getting it right to 9 decimal points so really it is all zeros.
+
+
+I think I need to try more dimensions
+
+

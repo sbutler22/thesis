@@ -1,0 +1,436 @@
+---
+title: "algorithm_steps"
+format: html
+---
+
+Since WOA evaluates the whole population each iteration (30 whales × 100 iterations = 3,000 calls), the script groups evaluations into blocks of 30, takes the best per block to get the per-iteration best trajectory, then thins to every 10th iteration.
+
+
+```{r}
+# ============================================================
+# Rastrigin Surface: Levenberg-Marquardt vs WOA
+# Packages needed: minpack.lm, metaheuristicOpt, plotly
+# install.packages(c("minpack.lm", "metaheuristicOpt", "plotly"))
+#
+# Rastrigin: f(x,y) = 20 + x^2 - 10*cos(2*pi*x)
+#                        + y^2 - 10*cos(2*pi*y)
+# Global minimum at (0, 0), f = 0
+# Dense grid of local optima — LM will get trapped,
+# WOA's population search gives it a better shot.
+#
+# LM note: Rastrigin is not a natural least-squares problem.
+# We use a finite-difference Jacobian trick: represent f as
+# a single residual r = sqrt(f + eps), so sum(r^2) ~ f.
+# LM will still follow gradient descent steps but won't have
+# the curvature information to jump over local optima.
+# ============================================================
+
+library(minpack.lm)
+library(metaheuristicOpt)
+library(plotly)
+
+# ============================================================
+# 1. OBJECTIVE FUNCTION
+# ============================================================
+rastrigin <- function(params) {
+  x <- params[1]; y <- params[2]
+  20 + x^2 - 10*cos(2*pi*x) + y^2 - 10*cos(2*pi*y)
+}
+
+# ============================================================
+# 2. SURFACE GRID
+# ============================================================
+x_seq <- seq(-5, 5, length.out = 100)
+y_seq <- seq(-5, 5, length.out = 100)
+z_mat <- outer(x_seq, y_seq, function(x, y) {
+  20 + x^2 - 10*cos(2*pi*x) + y^2 - 10*cos(2*pi*y)
+})
+
+# ============================================================
+# 3. LEVENBERG-MARQUARDT
+#    Single residual r = sqrt(f + eps); sum(r^2) = f.
+#    LM uses finite differences on r to approximate gradient.
+#    Starting point away from origin so it has to work.
+# ============================================================
+lm_path <- data.frame(x = numeric(), y = numeric(), z = numeric())
+
+residual_fn <- function(params) {
+  z_val <- rastrigin(params)
+  lm_path <<- rbind(lm_path, data.frame(
+    x = params[1], y = params[2], z = z_val
+  ))
+  sqrt(z_val + 1e-10)   # single residual — LM gets gradient info only
+}
+
+lm_start <- c(x = 3.5, y = 3.5)   # far corner, several local optima away
+
+lm_result <- nls.lm(
+  par     = lm_start,
+  fn      = residual_fn,
+  control = nls.lm.control(maxiter = 500, ftol = 1e-12, ptol = 1e-12)
+)
+
+cat("=== RASTRIGIN ===\n")
+cat("LM converged to:", round(lm_result$par, 5),
+    "| f =", round(rastrigin(lm_result$par), 5), "\n")
+cat("LM path steps:", nrow(lm_path), "\n")
+
+# Deduplicate consecutive identical positions (LM sometimes
+# re-evaluates the same point for Jacobian estimation)
+lm_path_dedup <- lm_path[c(TRUE, rowSums(
+  abs(tail(lm_path, -1)[,1:2] - head(lm_path, -1)[,1:2])
+) > 1e-8), ]
+
+# ============================================================
+# 4. WOA
+# ============================================================
+woa_evals   <- data.frame(x = numeric(), y = numeric(),
+                           z = numeric(), eval = integer())
+eval_counter <- 0L
+
+woa_obj <- function(params) {
+  z_val        <- rastrigin(params)
+  eval_counter <<- eval_counter + 1L
+  woa_evals   <<- rbind(woa_evals, data.frame(
+    x = params[1], y = params[2], z = z_val, eval = eval_counter
+  ))
+  z_val
+}
+
+numVar   <- 2
+rangeVar <- matrix(c(-5, 5, -5, 5), nrow = 2)
+
+set.seed(42)
+woa_result <- metaOpt(
+  FUN       = woa_obj,
+  optimType = "MIN",
+  algorithm = "WOA",
+  numVar    = numVar,
+  rangeVar  = rangeVar,
+  control   = list(numPopulation = 40, maxIter = 150)
+)
+
+cat("WOA converged to:", round(woa_result$result, 5),
+    "| f =", round(rastrigin(woa_result$result), 5), "\n")
+cat("WOA total evaluations:", nrow(woa_evals), "\n")
+
+num_pop  <- 40
+num_iter <- 150
+
+woa_path <- do.call(rbind, lapply(seq_len(num_iter), function(i) {
+  idx   <- ((i-1)*num_pop + 1) : min(i*num_pop, nrow(woa_evals))
+  block <- woa_evals[idx, ]
+  best  <- block[which.min(block$z), ]
+  data.frame(x = best$x, y = best$y, z = best$z, iter = i)
+}))
+
+keep_idx      <- unique(c(1, seq(10, num_iter, by = 10), num_iter))
+woa_path_thin <- woa_path[woa_path$iter %in% keep_idx, ]
+
+# ============================================================
+# 5. PLOT
+# ============================================================
+# Clamp z for colour scale so the local optima ripples are visible
+z_plot <- pmin(z_mat, 60)
+
+fig <- plot_ly() %>%
+
+  add_surface(
+    x          = x_seq,
+    y          = y_seq,
+    z          = t(z_plot),
+    colorscale = "Viridis",
+    opacity    = 0.72,
+    showscale  = FALSE,
+    name       = "Rastrigin surface"
+  ) %>%
+
+  add_trace(
+    data   = lm_path_dedup,
+    x = ~x, y = ~y, z = ~z,
+    type   = "scatter3d", mode = "lines+markers",
+    line   = list(color = "red",  width = 5),
+    marker = list(color = "red",  size  = 5, symbol = "circle"),
+    name   = "Levenberg-Marquardt"
+  ) %>%
+
+  add_trace(
+    x = lm_path_dedup$x[1], y = lm_path_dedup$y[1],
+    z = lm_path_dedup$z[1],
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "darkred", size = 9, symbol = "circle"),
+    name = "LM start"
+  ) %>%
+
+  add_trace(
+    data   = woa_path_thin,
+    x = ~x, y = ~y, z = ~z,
+    type   = "scatter3d", mode = "lines+markers",
+    line   = list(color = "cyan",  width = 5),
+    marker = list(color = "cyan",  size  = 5, symbol = "circle"),
+    name   = "WOA (every 10th iter)"
+  ) %>%
+
+  add_trace(
+    x = woa_path_thin$x[1], y = woa_path_thin$y[1],
+    z = woa_path_thin$z[1],
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "blue", size = 9, symbol = "circle"),
+    name = "WOA start (population best)"
+  ) %>%
+
+  add_trace(
+    x = 0, y = 0, z = 0,
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "yellow", size = 11, symbol = "diamond"),
+    name = "Global minimum (0,0)"
+  ) %>%
+
+  layout(
+    title = "Rastrigin: Levenberg-Marquardt vs WOA",
+    scene = list(
+      xaxis  = list(title = "x"),
+      yaxis  = list(title = "y"),
+      zaxis  = list(title = "f(x,y)"),
+      camera = list(eye = list(x = 1.7, y = 1.7, z = 1.1))
+    ),
+    legend = list(x = 0.01, y = 0.99),
+    annotations = list(list(
+      text = paste0(
+        "LM final: (", round(lm_result$par[1],3), ", ",
+        round(lm_result$par[2],3), ")  f=",
+        round(rastrigin(lm_result$par),3),
+        "<br>WOA final: (", round(woa_result$result[1],3), ", ",
+        round(woa_result$result[2],3), ")  f=",
+        round(rastrigin(woa_result$result),3)
+      ),
+      xref = "paper", yref = "paper",
+      x = 0.01, y = 0.06,
+      showarrow = FALSE,
+      font = list(size = 12, color = "white"),
+      bgcolor = "rgba(0,0,0,0.5)"
+    ))
+  )
+
+htmlwidgets::saveWidget(fig, "rastrigin_optim.html", selfcontained = TRUE)
+cat("Saved to rastrigin_optim.html\n")
+
+fig
+```
+
+
+
+```{r}
+# ============================================================
+# Rosenbrock Surface: Levenberg-Marquardt vs WOA
+# Packages needed: minpack.lm, metaheuristicOpt, plotly
+# install.packages(c("minpack.lm", "metaheuristicOpt", "plotly"))
+#
+# Rosenbrock: f(x,y) = (1 - x)^2 + 100*(y - x^2)^2
+# Global minimum at (1, 1), f = 0
+# Unimodal but has a narrow curved banana-shaped valley.
+# LM excels here (natural least-squares structure).
+# WOA struggles with the narrow valley — its position updates
+# tend to overshoot or miss the valley floor.
+#
+# LM residuals (natural formulation):
+#   r1 = 1 - x          => r1^2 = (1-x)^2
+#   r2 = 10*(y - x^2)   => r2^2 = 100*(y-x^2)^2
+# sum(r^2) = f(x,y) exactly. This is the ideal case for LM.
+# ============================================================
+
+library(minpack.lm)
+library(metaheuristicOpt)
+library(plotly)
+
+# ============================================================
+# 1. OBJECTIVE FUNCTION
+# ============================================================
+rosenbrock <- function(params) {
+  x <- params[1]; y <- params[2]
+  (1 - x)^2 + 100*(y - x^2)^2
+}
+
+# ============================================================
+# 2. SURFACE GRID
+# Clamp display to z <= 500 so the valley is visible
+# ============================================================
+x_seq <- seq(-2, 2,   length.out = 100)
+y_seq <- seq(-0.5, 3, length.out = 100)
+z_mat <- outer(x_seq, y_seq, function(x, y) {
+  pmin((1 - x)^2 + 100*(y - x^2)^2, 500)
+})
+
+# ============================================================
+# 3. LEVENBERG-MARQUARDT
+#    Natural residual formulation — LM is perfectly suited here.
+# ============================================================
+lm_path <- data.frame(x = numeric(), y = numeric(), z = numeric())
+
+residual_fn <- function(params) {
+  x <- params[1]; y <- params[2]
+  lm_path <<- rbind(lm_path, data.frame(
+    x = x, y = y, z = rosenbrock(params)
+  ))
+  c(1 - x, 10*(y - x^2))   # natural residual vector
+}
+
+lm_start <- c(x = -1.5, y = 2.5)   # far corner of the banana
+
+lm_result <- nls.lm(
+  par     = lm_start,
+  fn      = residual_fn,
+  control = nls.lm.control(maxiter = 500, ftol = 1e-14, ptol = 1e-14)
+)
+
+cat("=== ROSENBROCK ===\n")
+cat("LM converged to:", round(lm_result$par, 6),
+    "| f =", round(rosenbrock(lm_result$par), 8), "\n")
+cat("LM path steps:", nrow(lm_path), "\n")
+
+# Deduplicate (Jacobian evaluations re-use same point)
+lm_path_dedup <- lm_path[c(TRUE, rowSums(
+  abs(tail(lm_path, -1)[,1:2] - head(lm_path, -1)[,1:2])
+) > 1e-8), ]
+
+# Clamp z for plotting so the path stays visible on the surface
+lm_path_dedup$z <- pmin(lm_path_dedup$z, 500)
+
+# ============================================================
+# 4. WOA
+# ============================================================
+woa_evals    <- data.frame(x = numeric(), y = numeric(),
+                            z = numeric(), eval = integer())
+eval_counter <- 0L
+
+woa_obj <- function(params) {
+  z_val        <- rosenbrock(params)
+  eval_counter <<- eval_counter + 1L
+  woa_evals   <<- rbind(woa_evals, data.frame(
+    x = params[1], y = params[2], z = z_val, eval = eval_counter
+  ))
+  z_val
+}
+
+numVar   <- 2
+rangeVar <- matrix(c(-2, 2, -0.5, 3), nrow = 2)
+
+set.seed(42)
+woa_result <- metaOpt(
+  FUN       = woa_obj,
+  optimType = "MIN",
+  algorithm = "WOA",
+  numVar    = numVar,
+  rangeVar  = rangeVar,
+  control   = list(numPopulation = 40, maxIter = 200)
+)
+
+cat("WOA converged to:", round(woa_result$result, 6),
+    "| f =", round(rosenbrock(woa_result$result), 8), "\n")
+cat("WOA total evaluations:", nrow(woa_evals), "\n")
+
+num_pop  <- 40
+num_iter <- 200
+
+woa_path <- do.call(rbind, lapply(seq_len(num_iter), function(i) {
+  idx   <- ((i-1)*num_pop + 1) : min(i*num_pop, nrow(woa_evals))
+  block <- woa_evals[idx, ]
+  best  <- block[which.min(block$z), ]
+  data.frame(x = best$x, y = best$y, z = best$z, iter = i)
+}))
+
+keep_idx      <- unique(c(1, seq(10, num_iter, by = 10), num_iter))
+woa_path_thin <- woa_path[woa_path$iter %in% keep_idx, ]
+
+# Clamp z for visibility
+woa_path_thin$z <- pmin(woa_path_thin$z, 500)
+
+# ============================================================
+# 5. PLOT
+# ============================================================
+fig <- plot_ly() %>%
+
+  add_surface(
+    x          = x_seq,
+    y          = y_seq,
+    z          = t(z_mat),
+    colorscale = "Hot",
+    opacity    = 0.72,
+    showscale  = FALSE,
+    name       = "Rosenbrock surface"
+  ) %>%
+
+  add_trace(
+    data   = lm_path_dedup,
+    x = ~x, y = ~y, z = ~z,
+    type   = "scatter3d", mode = "lines+markers",
+    line   = list(color = "red",  width = 5),
+    marker = list(color = "red",  size  = 5, symbol = "circle"),
+    name   = "Levenberg-Marquardt"
+  ) %>%
+
+  add_trace(
+    x = lm_path_dedup$x[1], y = lm_path_dedup$y[1],
+    z = lm_path_dedup$z[1],
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "darkred", size = 9, symbol = "circle"),
+    name = "LM start"
+  ) %>%
+
+  add_trace(
+    data   = woa_path_thin,
+    x = ~x, y = ~y, z = ~z,
+    type   = "scatter3d", mode = "lines+markers",
+    line   = list(color = "cyan",  width = 5),
+    marker = list(color = "cyan",  size  = 5, symbol = "circle"),
+    name   = "WOA (every 10th iter)"
+  ) %>%
+
+  add_trace(
+    x = woa_path_thin$x[1], y = woa_path_thin$y[1],
+    z = woa_path_thin$z[1],
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "blue", size = 9, symbol = "circle"),
+    name = "WOA start (population best)"
+  ) %>%
+
+  add_trace(
+    x = 1, y = 1, z = 0,
+    type = "scatter3d", mode = "markers",
+    marker = list(color = "yellow", size = 11, symbol = "diamond"),
+    name = "Global minimum (1,1)"
+  ) %>%
+
+  layout(
+    title = "Rosenbrock: Levenberg-Marquardt vs WOA",
+    scene = list(
+      xaxis  = list(title = "x"),
+      yaxis  = list(title = "y"),
+      zaxis  = list(title = "f(x,y) [clamped at 500]"),
+      camera = list(eye = list(x = 1.8, y = -1.5, z = 1.2))
+    ),
+    legend = list(x = 0.01, y = 0.99),
+    annotations = list(list(
+      text = paste0(
+        "LM final: (", round(lm_result$par[1],4), ", ",
+        round(lm_result$par[2],4), ")  f=",
+        round(rosenbrock(lm_result$par), 6),
+        "<br>WOA final: (", round(woa_result$result[1],4), ", ",
+        round(woa_result$result[2],4), ")  f=",
+        round(rosenbrock(woa_result$result), 6)
+      ),
+      xref = "paper", yref = "paper",
+      x = 0.01, y = 0.06,
+      showarrow = FALSE,
+      font = list(size = 12, color = "white"),
+      bgcolor = "rgba(0,0,0,0.5)"
+    ))
+  )
+
+htmlwidgets::saveWidget(fig, "rosenbrock_optim.html", selfcontained = TRUE)
+cat("Saved to rosenbrock_optim.html\n")
+fig
+```
+
+
+

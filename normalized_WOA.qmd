@@ -1,0 +1,574 @@
+---
+title: "normalized_WOA"
+format: html
+---
+
+---
+title: "z_score_woa"
+format: html
+---
+
+```{r}
+# load libraries
+library(tidyverse)
+library(metaheuristicOpt)
+library(minpack.lm)
+library(furrr)
+library(R.utils)
+library(tictoc)
+library(randtoolbox)
+
+
+# source functions
+source("WOA_functions.R")
+
+```
+
+
+Here I want to reprogram WOA to take steps using z-score's so that the crazy mismatch in scale between a and the other parameters does not impact the functions ability to converge to the minimum.
+
+So,
+
+# z score woa
+
+```{r}
+# define bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48,
+                   0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79), 
+                 nrow = 2, byrow = TRUE)
+
+# normalization functions
+normalize_params <- function(params, bounds) {
+  lower <- bounds[1, ]
+  upper <- bounds[2, ]
+  range <- upper - lower
+  (params - lower) / range  # maps to [0, 1]
+}
+
+denormalize_params <- function(norm_params, bounds) {
+  lower <- bounds[1, ]
+  upper <- bounds[2, ]
+  range <- upper - lower
+  norm_params * range + lower  # maps back to original scale
+}
+```
+
+```{r}
+# Modified engineWOA - stays in original space, normalizes only for steps
+engineWOA_normalized_steps <- function(FUN, optimType, maxIter, lowerBound, upperBound, 
+                                       whale, bounds_original) {
+  
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2)/maxIter)
+    a2 <- -1 + t * ((-1)/maxIter)
+    
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      l <- (a2 - 1) * runif(1) + 1
+      p <- runif(1)
+      
+      # NORMALIZE current whale and best position for step calculation
+      whale_i_norm <- normalize_params(whale[i, ], bounds_original)
+      bestPos_norm <- normalize_params(bestPos, bounds_original)
+      
+      # Create normalized copy for updates
+      whale_i_norm_new <- whale_i_norm
+      
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * runif(1) + 1)
+            # NORMALIZE random whale for distance calculation
+            x_rand_norm <- normalize_params(whale[rand.index, ], bounds_original)
+            
+            D.x.rand <- abs(C * x_rand_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- x_rand_norm[j] - A * D.x.rand
+          }
+          else if (abs(A) < 1) {
+            D.bestPos <- abs(C * bestPos_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- bestPos_norm[j] - A * D.bestPos
+          }
+        }
+        else if (p >= 0.5) {
+          distance <- abs(bestPos_norm[j] - whale_i_norm[j])
+          whale_i_norm_new[j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos_norm[j]
+        }
+      }
+      
+      # DENORMALIZE back to original space after taking normalized step
+      whale[i, ] <- denormalize_params(whale_i_norm_new, bounds_original)
+      
+      # Check bounds in original space
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      # Evaluate fitness in original space
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  
+  # Return best position (already in original scale)
+  return(bestPos)
+}
+
+# Modified WOA wrapper - works entirely in original space
+WOA_normalized_steps <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+                                 maxIter = 500, rangeVar) {
+  
+  dimension <- ncol(rangeVar)
+  
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  
+  if (optimType == "MAX") 
+    optimType <- -1
+  else 
+    optimType <- 1
+  
+  # Original bounds (not normalized)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  
+  # Generate random whales in ORIGINAL parameter space
+  whale <- generateRandom(numPopulation, dimension, lowerBound, upperBound)
+  
+  # Run optimization (stays in original space throughout)
+  bestPos <- engineWOA_normalized_steps(FUN, optimType, maxIter, lowerBound, 
+                                        upperBound, whale, rangeVar)
+  
+  return(bestPos)
+}
+
+# Usage
+run_WOA_normalized_steps_double <- function(data) {
+  result <- WOA_normalized_steps(
+    FUN = function(x) objective_SSE_double(x, data),
+    optimType = "MIN",
+    numVar = 7,
+    numPopulation = 40,
+    maxIter = 2500,
+    rangeVar = bounds
+  )
+  
+  best_sse <- objective_SSE_double(result, data)
+  
+  list(
+    h0 = result[1],
+    h1 = result[2],
+    h2 = result[3],
+    a1 = result[4],
+    a2 = result[5],
+    t1 = result[6],
+    t2 = result[7],
+    best_sse = best_sse
+  )
+}
+```
+
+
+# test it
+
+```{r}
+# test it
+# generate test data
+set.seed(42)
+test_data <- generate_piecewise_data(
+  x_vals = seq(0, 300, by = 20), 
+  reps = 5, 
+  dispersion = 10,
+  a1 = 0.04, a2 = 0.03, t1 = 110, t2 = 240, 
+  h1 = 750, h2 = 400, h0 = 20
+)
+
+
+
+# Test it
+result_norm <- run_WOA_normalized_steps_double(test_data)
+print(result_norm)
+
+result_og <- run_WOA_double(test_data)
+print(result_og)
+```
+
+
+
+```{r, eval=FALSE}
+# Run each 10 times to compare
+set.seed(123)
+results_norm <- replicate(10, run_WOA_normalized_steps_double(test_data)$best_sse)
+set.seed(123)
+results_og <- replicate(10, run_WOA_double(test_data)$best_sse)
+
+cat("Normalized - Mean:", mean(results_norm), "SD:", sd(results_norm), "\n")
+cat("Original - Mean:", mean(results_og), "SD:", sd(results_og), "\n")
+```
+
+
+Now that that's all set up, I want to see how the improved WOA (WOA_normalized) compares against LMA:
+
+```{r}
+# set up multicores
+plan(multisession, workers = 5)  # i have 8 total
+
+tic()
+seeds <- 1:100
+
+# generate the data with given seeds
+double_sig_data <- map(seeds, function(s) {
+  set.seed(s)
+  generate_piecewise_data()
+})
+
+# helper function to run everything smoothly in parallel
+run_woa_parallel <- function(data, i, algo_func, algo_name) {
+  out <- withSeed({
+    algo_func(data)
+  }, seed = seeds[i])  # ensures all random numbers inside algo_func are reproducible
+
+  out$dataset_id <- i
+  out$seed <- seeds[i]
+  out$algorithm <- algo_name
+  out
+}
+
+# define bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48,
+                   0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79), nrow = 2, byrow = TRUE)
+
+# woa w/ normalized step sizes
+double_norm_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_normalized_double, "WOA_norm"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+
+# og woa
+double_og_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_double, "WOA"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+
+# lma
+lma_double_results_df <- map2_dfr(
+  double_sig_data,  
+  seeds,
+  ~run_lma_fit_double(.x, dataset_id = which(seeds == .y), seed = .y)
+)
+
+
+norm_vs_lma_results_double <- bind_rows(double_norm_df, double_og_df, lma_double_results_df)
+toc()
+```
+
+
+```{r}
+norm_vs_lma_results_double |>
+  ggplot(aes(x = dataset_id, y = best_sse)) +
+  geom_point(aes(color = algorithm))
+```
+
+
+```{r}
+norm_vs_lma_results_double |>
+  filter(algorithm == "WOA") |>
+  summarize(mean_sse = mean(best_sse))
+```
+
+Even with normalized steps, WOA is just bad at this problem. It is moving randomly around the valley and the spirals etc. I don't think match the downhill movement.
+
+
+
+
+
+# verify for thesis
+
+```{r}
+# Modified engineWOA with dimension verification
+engineWOA_normalized_steps <- function(FUN, optimType, maxIter, lowerBound, upperBound, 
+                                       whale, bounds_original) {
+  
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  
+  # Flag to print dimension info only once
+  printed_dims <- FALSE
+  
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2)/maxIter)
+    a2 <- -1 + t * ((-1)/maxIter)
+    
+    # Print 'a' dimension check (only first iteration)
+    if (t == 1) {
+      cat("\n\n========== DIMENSION VERIFICATION (Iteration 1) ==========\n")
+      cat(sprintf("'a' value: %.6f\n", a))
+      cat(sprintf("'a' is scalar: %s\n", is.vector(a) && length(a) == 1))
+      cat(sprintf("'a' dimensions: %s\n", paste(dim(a), collapse=" x ")))
+      cat(sprintf("'a' length: %d\n", length(a)))
+      cat(sprintf("'a2' value: %.6f\n", a2))
+      cat("=========================================================\n\n")
+    }
+    
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      l <- (a2 - 1) * runif(1) + 1
+      p <- runif(1)
+      
+      # Print dimension checks for first whale in first iteration
+      if (t == 1 && i == 1 && !printed_dims) {
+        cat("\n========== SCALAR PARAMETER VERIFICATION ==========\n")
+        cat(sprintf("Whale index: %d, Iteration: %d\n\n", i, t))
+        
+        # Check r1, r2
+        cat("Random values (should be scalars):\n")
+        cat(sprintf("  r1 = %.6f, length = %d, is.scalar = %s\n", 
+                    r1, length(r1), length(r1) == 1))
+        cat(sprintf("  r2 = %.6f, length = %d, is.scalar = %s\n", 
+                    r2, length(r2), length(r2) == 1))
+        
+        # Check A, C
+        cat("\nCoefficients (should be scalars):\n")
+        cat(sprintf("  A = 2*a*r1 - a = 2*%.4f*%.4f - %.4f = %.6f\n", 
+                    a, r1, a, A))
+        cat(sprintf("  A length = %d, is.scalar = %s\n", length(A), length(A) == 1))
+        cat(sprintf("  C = 2*r2 = 2*%.4f = %.6f\n", r2, C))
+        cat(sprintf("  C length = %d, is.scalar = %s\n", length(C), length(C) == 1))
+        
+        # Check b, l, p
+        cat("\nOther parameters (should be scalars):\n")
+        cat(sprintf("  b = %d, length = %d\n", b, length(b)))
+        cat(sprintf("  l = %.6f, length = %d\n", l, length(l)))
+        cat(sprintf("  p = %.6f, length = %d\n", p, length(p)))
+        
+        cat("\n====================================================\n\n")
+        printed_dims <- TRUE
+      }
+      
+      # NORMALIZE current whale and best position for step calculation
+      whale_i_norm <- normalize_params(whale[i, ], bounds_original)
+      bestPos_norm <- normalize_params(bestPos, bounds_original)
+      
+      # Create normalized copy for updates
+      whale_i_norm_new <- whale_i_norm
+      
+      # Track if A, r values change across dimensions
+      if (t == 1 && i == 1) {
+        cat("\n========== PER-DIMENSION UPDATE VERIFICATION ==========\n")
+        cat(sprintf("Number of dimensions (parameters): %d\n", ncol(whale)))
+        cat(sprintf("\nUsing SAME A = %.6f for ALL dimensions\n", A))
+        cat(sprintf("Using SAME C = %.6f for ALL dimensions\n", C))
+        cat(sprintf("Using SAME p = %.6f to determine update type\n\n", p))
+        
+        if (p < 0.5) {
+          cat("Update type: Encircling prey or Search (p < 0.5)\n")
+          if (abs(A) >= 1) {
+            cat(sprintf("  |A| = %.4f >= 1: SEARCH (exploration)\n", abs(A)))
+          } else {
+            cat(sprintf("  |A| = %.4f < 1: ENCIRCLE (exploitation)\n", abs(A)))
+          }
+        } else {
+          cat("Update type: Spiral (p >= 0.5)\n")
+          cat(sprintf("  Using l = %.6f for spiral\n", l))
+        }
+        cat("\nDimension-by-dimension updates:\n")
+      }
+      
+      for (j in 1:ncol(whale)) {
+        # Store old value for comparison
+        old_val <- whale_i_norm[j]
+        
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * runif(1) + 1)
+            # NORMALIZE random whale for distance calculation
+            x_rand_norm <- normalize_params(whale[rand.index, ], bounds_original)
+            
+            D.x.rand <- abs(C * x_rand_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- x_rand_norm[j] - A * D.x.rand
+            
+            # Print for first iteration, first whale
+            if (t == 1 && i == 1) {
+              cat(sprintf("  Dim %d: x_rand[%d]=%.4f, D=%.4f, new=%.4f (SAME A=%.4f used)\n", 
+                          j, j, x_rand_norm[j], D.x.rand, whale_i_norm_new[j], A))
+            }
+          }
+          else if (abs(A) < 1) {
+            D.bestPos <- abs(C * bestPos_norm[j] - whale_i_norm[j])
+            whale_i_norm_new[j] <- bestPos_norm[j] - A * D.bestPos
+            
+            # Print for first iteration, first whale
+            if (t == 1 && i == 1) {
+              cat(sprintf("  Dim %d: best[%d]=%.4f, D=%.4f, new=%.4f (SAME A=%.4f used)\n", 
+                          j, j, bestPos_norm[j], D.bestPos, whale_i_norm_new[j], A))
+            }
+          }
+        }
+        else if (p >= 0.5) {
+          distance <- abs(bestPos_norm[j] - whale_i_norm[j])
+          whale_i_norm_new[j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos_norm[j]
+          
+          # Print for first iteration, first whale
+          if (t == 1 && i == 1) {
+            cat(sprintf("  Dim %d: dist=%.4f, new=%.4f (SAME l=%.4f used)\n", 
+                        j, distance, whale_i_norm_new[j], l))
+          }
+        }
+      }
+      
+      if (t == 1 && i == 1) {
+        cat("=======================================================\n\n")
+        
+        # Summary verification
+        cat("========== SUMMARY VERIFICATION ==========\n")
+        cat("✓ A, C, p, l are SCALARS (1x1)\n")
+        cat("✓ SAME A value used across ALL dimensions\n")
+        cat("✓ SAME C value used across ALL dimensions\n")
+        cat("✓ SAME p value determines update type for ALL dimensions\n")
+        cat("✓ SAME l value used for spiral across ALL dimensions\n")
+        cat("✓ Each dimension j gets: new[j] = f(A, C, old[j], ...)\n")
+        cat("✓ The update is VECTORIZED - same scalars, different positions\n")
+        cat("==========================================\n\n")
+      }
+      
+      # DENORMALIZE back to original space after taking normalized step
+      whale[i, ] <- denormalize_params(whale_i_norm_new, bounds_original)
+      
+      # Check bounds in original space
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      # Evaluate fitness in original space
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  
+  # Return best position (already in original scale)
+  return(bestPos)
+}
+
+# Modified WOA wrapper - works entirely in original space
+WOA_normalized_steps <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+                                 maxIter = 500, rangeVar) {
+  
+  dimension <- ncol(rangeVar)
+  
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  
+  if (optimType == "MAX") 
+    optimType <- -1
+  else 
+    optimType <- 1
+  
+  # Original bounds (not normalized)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  
+  cat("\n========== WOA INITIALIZATION ==========\n")
+  cat(sprintf("Number of variables (dimensions): %d\n", dimension))
+  cat(sprintf("Population size: %d\n", numPopulation))
+  cat(sprintf("Max iterations: %d\n", maxIter))
+  cat(sprintf("Lower bounds: %s\n", paste(lowerBound, collapse=", ")))
+  cat(sprintf("Upper bounds: %s\n", paste(upperBound, collapse=", ")))
+  cat("========================================\n")
+  
+  # Generate random whales in ORIGINAL parameter space
+  whale <- generateRandom(numPopulation, dimension, lowerBound, upperBound)
+  
+  cat(sprintf("\nWhale population matrix dimensions: %d x %d\n", nrow(whale), ncol(whale)))
+  cat("(rows = whales, columns = parameters/dimensions)\n\n")
+  
+  # Run optimization (stays in original space throughout)
+  bestPos <- engineWOA_normalized_steps(FUN, optimType, maxIter, lowerBound, 
+                                        upperBound, whale, rangeVar)
+  
+  return(bestPos)
+}
+
+# Additional utility function to verify at any point in your code
+verify_scalar <- function(var, var_name) {
+  cat(sprintf("\nVerifying '%s':\n", var_name))
+  cat(sprintf("  Value: %s\n", paste(var, collapse=", ")))
+  cat(sprintf("  Length: %d\n", length(var)))
+  cat(sprintf("  Is scalar (length=1): %s\n", length(var) == 1))
+  cat(sprintf("  Class: %s\n", class(var)))
+  if (!is.null(dim(var))) {
+    cat(sprintf("  Dimensions: %s\n", paste(dim(var), collapse=" x ")))
+  } else {
+    cat("  Dimensions: NULL (not a matrix/array)\n")
+  }
+  cat(sprintf("  Is scalar: %s\n\n", is.vector(var) && length(var) == 1))
+}
+
+# Example usage demonstration
+demo_dimension_check <- function() {
+  cat("\n============ DEMONSTRATION ============\n\n")
+  
+  # Simulate the key calculations
+  t <- 1
+  maxIter <- 500
+  a <- 2 - t * ((2)/maxIter)
+  r1 <- runif(1)
+  r2 <- runif(1)
+  A <- 2 * a * r1 - a
+  C <- 2 * r2
+  
+  verify_scalar(a, "a")
+  verify_scalar(r1, "r1")
+  verify_scalar(r2, "r2")
+  verify_scalar(A, "A")
+  verify_scalar(C, "C")
+  
+  cat("CONCLUSION:\n")
+  cat("All parameters (a, r1, r2, A, C) are SCALARS (1x1).\n")
+  cat("They are computed ONCE per whale per iteration.\n")
+  cat("The SAME scalar values are used to update ALL dimensions.\n")
+  cat("Each dimension j uses: new_pos[j] = f(A, old_pos[j], ...)\n")
+  cat("where A is the SAME for all j.\n")
+  cat("\n=======================================\n")
+}
+
+# Run the demonstration
+demo_dimension_check()
+```
+
+

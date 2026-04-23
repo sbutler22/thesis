@@ -1,0 +1,429 @@
+---
+title: "double_sigmoidal_runs_for_plots"
+format: html
+editor: source
+---
+
+```{r}
+seeds <- 1:200
+
+# ── Generate data storing raw min/max BEFORE normalization ────────────────
+double_sig_data <- vector("list", length(seeds))
+data_scales     <- vector("list", length(seeds))
+
+for (i in seq_along(seeds)) {
+  set.seed(seeds[i])
+  
+  x_vals     <- seq(0, 300, by = 20)
+  x_repeated <- rep(x_vals, each = 5)
+  
+  x_dense  <- seq(0, 300, length.out = 1000)
+  f0_vals  <- f0(x_dense, 0.04, 110, 0.03, 240)
+  argument <- x_dense[which.max(f0_vals)]
+  const    <- f0(argument, 0.04, 110, 0.03, 240)
+  y_true   <- f2_h0(x_repeated, 20, 750, 400, 0.04, 110, 0.03, 240, const, argument)
+  y_noisy  <- rnorm(length(y_true), mean = y_true, sd = 10)
+  
+  raw_int_min <- min(y_noisy)
+  raw_int_max <- max(y_noisy)
+  
+  data_scales[[i]] <- tibble(
+    seed    = seeds[i],
+    int_min = raw_int_min,
+    int_max = raw_int_max
+  )
+  
+  double_sig_data[[i]] <- tibble(
+    time      = (x_repeated - min(x_repeated)) / (max(x_repeated) - min(x_repeated)),
+    intensity = (y_noisy    - raw_int_min)      / (raw_int_max     - raw_int_min)
+  )
+}
+
+data_scales <- bind_rows(data_scales)
+print(data_scales)
+
+# define bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48,
+                    0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79),
+                 nrow = 2, byrow = TRUE)
+
+run_woa_parallel <- function(data, i, algo_func, algo_name) {
+  out <- algo_func(data)
+  out$dataset_id <- i
+  out$seed       <- seeds[i]
+  out$algorithm  <- algo_name
+  out
+}
+```
+
+```{r}
+# set up multicores
+plan(multisession, workers = 5)
+
+# ── True parameters (raw scale) ────────────────────────────────────────────
+true_params_double <- c(h0 = 20, h1 = 750, h2 = 400,
+                        a1 = 0.04, a2 = 0.03,
+                        t1 = 110,  t2 = 240)
+
+# ── Residual function for LMA inside hybrid ────────────────────────────────
+double_sig_residual <- function(params, data) {
+  predicted <- double_sig_fit_formula(
+    data$time,
+    params[1], params[2], params[3],
+    params[4], params[5], params[6], params[7]
+  )
+  data$intensity - predicted
+}
+
+# ── WOA-LMA Hybrid runner for double sigmoidal ─────────────────────────────
+run_hybrid_double <- function(data, i,
+                              numPopulation = 40,
+                              max_iter_woa  = 500) {
+  result <- woa_lma_hybrid(
+    FUN           = function(x) objective_SSE_double(x, data),
+    residual_fn   = function(x) double_sig_residual(x, data),
+    numVar        = ncol(bounds),
+    rangeVar      = bounds,
+    numPopulation = numPopulation,
+    max_iter_woa  = max_iter_woa,
+    div_threshold = 0.05,
+    n_lma         = 10,
+    min_dist      = 0.01,
+    verbose       = FALSE
+  )
+  list(
+    h0         = result$par[1],
+    h1         = result$par[2],
+    h2         = result$par[3],
+    a1         = result$par[4],
+    a2         = result$par[5],
+    t1         = result$par[6],
+    t2         = result$par[7],
+    best_sse   = result$value,
+    dataset_id = i,
+    seed       = seeds[i],
+    algorithm  = "WOA-LMA Hybrid"
+  )
+}
+
+# ── Run all four algorithms ────────────────────────────────────────────────
+epsilon <- 0.01
+a_min   <- 0.01
+a_max   <- 180
+
+options(future.rng.onMisuse = "ignore")
+tic.clearlog()
+
+tic("WOA")
+double_woa_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_double, "WOA"),
+  seed = TRUE
+)
+toc(log = TRUE, quiet = TRUE)
+
+tic("WOA Lévy")
+double_levy_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_levy_double, "WOA Lévy"),
+  seed = TRUE
+)
+toc(log = TRUE, quiet = TRUE)
+
+tic("WOA-LMA Hybrid")
+double_hybrid_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_hybrid_double(.x, .y),
+  seed = TRUE
+)
+toc(log = TRUE, quiet = TRUE)
+
+tic("LMA with random starts")
+double_lma_df <- future_map2_dfr(
+  double_sig_data,
+  seq_along(double_sig_data),
+  ~ run_lma_fit_double(.x, dataset_id = .y, seed = seeds[.y]),
+  seed = TRUE
+)
+toc(log = TRUE, quiet = TRUE)
+
+# ── Combine results ────────────────────────────────────────────────────────
+results_double <- bind_rows(
+  double_woa_df,
+  double_levy_df,
+  double_hybrid_df,
+  double_lma_df |> mutate(algorithm = "LMA with random starts")
+)
+
+# ── Flag failed runs and compute l2 norm ──────────────────────────────────
+results_double <- results_double |>
+  left_join(data_scales, by = "seed") |>
+  mutate(
+    best_sse = if_else(best_sse >= 1e10, NA_real_, best_sse),
+    true_h0  = (true_params_double["h0"] - int_min) / (int_max - int_min),
+    true_h1  = (true_params_double["h1"] - int_min) / (int_max - int_min),
+    true_h2  = (true_params_double["h2"] - int_min) / (int_max - int_min),
+    true_a1  = (true_params_double["a1"] - a_min)   / (a_max - a_min),
+    true_a2  = (true_params_double["a2"] - a_min)   / (a_max - a_min),
+    true_t1  = true_params_double["t1"] / 300,
+    true_t2  = true_params_double["t2"] / 300,
+    a1_norm  = (a1 - a_min) / (a_max - a_min),
+    a2_norm  = (a2 - a_min) / (a_max - a_min),
+    l2_norm  = sqrt(
+      (h0 - true_h0)^2 +
+      (h1 - true_h1)^2 +
+      (h2 - true_h2)^2 +
+      (a1_norm - true_a1)^2 +
+      (a2_norm - true_a2)^2 +
+      (t1 - true_t1)^2 +
+      (t2 - true_t2)^2
+    )
+  ) |>
+  select(-c(int_min, int_max, a1_norm, a2_norm,
+            true_h0, true_h1, true_h2, true_a1, true_a2, true_t1, true_t2))
+
+# quick check
+# results_double |>
+#   select(seed, algorithm, h0, h1, h2, t1, t2, l2_norm) |>
+#   filter(seed == 1)
+
+# ── Summary table ──────────────────────────────────────────────────────────
+all_algs_double_df <- results_double |>
+  group_by(algorithm) |>
+  summarise(
+    mean_obj_value   = mean(best_sse,   na.rm = TRUE),
+    median_obj_value = median(best_sse, na.rm = TRUE),
+    min_obj_value    = min(best_sse,    na.rm = TRUE),
+    max_obj_value    = max(best_sse,    na.rm = TRUE),
+    n_failed         = sum(is.na(best_sse)),
+    n_under_epsilon  = sum(best_sse < epsilon, na.rm = TRUE),
+    mean_param_acc   = mean(l2_norm,   na.rm = TRUE),
+    median_param_acc = median(l2_norm, na.rm = TRUE),
+    min_param_acc    = min(l2_norm,    na.rm = TRUE),
+    max_param_acc    = max(l2_norm,    na.rm = TRUE)
+  )
+
+# ── Timing table ───────────────────────────────────────────────────────────
+timing_double <- tic.log(format = FALSE) |>
+  map_dfr(~ tibble(
+    algorithm = .x$msg,
+    time_sec  = .x$toc - .x$tic
+  ))
+
+time_per_seed_double <- timing_double |>
+  mutate(time_sec = time_sec / length(seeds))
+colnames(time_per_seed_double) <- c("Algorithm", "Time (sec)")
+```
+
+
+```{r}
+results_double <- bind_rows(
+  double_woa_df,
+  double_levy_df,
+  double_hybrid_df,
+  double_lma_df |> mutate(algorithm = "LMA with random starts")
+) |>
+  select(-any_of(c("int_min", "int_max", "l2_norm"))) |>
+  left_join(data_scales, by = "seed") |>
+  mutate(
+    best_sse = if_else(best_sse >= 1e10, NA_real_, best_sse),
+    true_h0  = (true_params_double["h0"] - int_min) / (int_max - int_min),
+    true_h1  = (true_params_double["h1"] - int_min) / (int_max - int_min),
+    true_h2  = (true_params_double["h2"] - int_min) / (int_max - int_min),
+    true_a1  = true_params_double["a1"] * 300,
+    true_a2  = true_params_double["a2"] * 300,
+    true_t1  = true_params_double["t1"] / 300,
+    true_t2  = true_params_double["t2"] / 300,
+    l2_norm  = sqrt(
+      (h0 - true_h0)^2 +
+      (h1 - true_h1)^2 +
+      (h2 - true_h2)^2 +
+      (a1 - true_a1)^2 +
+      (a2 - true_a2)^2 +
+      (t1 - true_t1)^2 +
+      (t2 - true_t2)^2
+    )
+  ) |>
+  select(-c(int_min, int_max,
+            true_h0, true_h1, true_h2, true_a1, true_a2, true_t1, true_t2))
+
+# verify — a1 should be close to 12, a2 close to 9 for good algorithms
+results_double |>
+  filter(seed == 1) |>
+  select(algorithm, a1, a2, t1, t2, l2_norm)
+
+all_algs_double_df <- results_double |>
+  group_by(algorithm) |>
+  summarise(
+    mean_obj_value   = mean(best_sse,   na.rm = TRUE),
+    median_obj_value = median(best_sse, na.rm = TRUE),
+    min_obj_value    = min(best_sse,    na.rm = TRUE),
+    max_obj_value    = max(best_sse,    na.rm = TRUE),
+    n_failed         = sum(is.na(best_sse)),
+    n_under_epsilon  = sum(best_sse < epsilon, na.rm = TRUE),
+    mean_param_acc   = mean(l2_norm,   na.rm = TRUE),
+    median_param_acc = median(l2_norm, na.rm = TRUE),
+    min_param_acc    = min(l2_norm,    na.rm = TRUE),
+    max_param_acc    = max(l2_norm,    na.rm = TRUE)
+  )
+
+```
+
+
+
+
+
+```{r}
+
+# ── Colors ─────────────────────────────────────────────────────────────────
+algo_colors <- c(
+  "LMA with random starts" = "#2166AC",
+  "WOA Lévy"               = "#F98E2B",
+  "WOA-LMA Hybrid"         = "#74C8C0",
+  "WOA"                    = "#D6191B")
+
+# ── Plot 1: all algorithms ─────────────────────────────────────────────────
+results_double |>
+  ggplot(aes(x = seed, y = l2_norm)) +
+  geom_point(aes(color = algorithm)) +
+  geom_line(aes(color = algorithm), alpha = 0.5) +
+  scale_color_manual(values = algo_colors) +
+  theme_minimal() +
+  labs(x = "Seed", y = "Accuracy of Parameter Estimation",
+       title = "Accuracy of Parameter Estimates Across Algorithms (Double-sigmoidal)")
+
+
+results_double |>
+  ggplot(aes(x = seed, y = l2_norm)) +
+  geom_point(aes(color = algorithm)) +
+  geom_line(aes(color = algorithm), alpha = 0.5) +
+  scale_color_manual(values = algo_colors) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0, 300)) +
+  labs(x = "Seed", y = "Accuracy of Parameter Estimation",
+       title = "Accuracy of Parameter Estimates Across Algorithms (Double-sigmoidal)")
+
+# ── Plot 2: WOA vs hybrid only ─────────────────────────────────────────────
+results_double |>
+  filter(algorithm %in% c("WOA", "LMA with random starts", "WOA Lévy")) |>
+  ggplot(aes(x = seed, y = l2_norm)) +
+  geom_point(aes(color = algorithm)) +
+  geom_line(aes(color = algorithm), alpha = 0.5) +
+  scale_color_manual(values = algo_colors) +
+  theme_minimal() +
+  labs(x = "Seed", y = "Accuracy of Parameter Estimation",
+       title = "Accuracy of Parameter Estimates: WOA vs WOA Lévy vs LMA with random starts (Double-sigmoidal)")
+```
+
+# sequence instead of parallel
+
+```{r}
+# ── Test run: sequential ───────────────────────────────────────────────────
+seeds <- 1:3  # small batch to verify
+
+double_sig_data <- map(seeds, function(s) {
+  set.seed(s)
+  generate_piecewise_data()
+})
+
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48,
+                    0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79),
+                 nrow = 2, byrow = TRUE)
+
+true_params_double <- c(h0 = 20, h1 = 750, h2 = 400,
+                        a1 = 0.04, a2 = 0.03,
+                        t1 = 110,  t2 = 240)
+
+double_sig_residual <- function(params, data) {
+  predicted <- double_sig_fit_formula(
+    data$time,
+    params[1], params[2], params[3],
+    params[4], params[5], params[6], params[7]
+  )
+  data$intensity - predicted
+}
+
+run_hybrid_double <- function(data, i,
+                              numPopulation = 40,
+                              max_iter_woa  = 500) {
+  out <- withSeed({
+    result <- woa_lma_hybrid(
+      FUN           = function(x) objective_SSE_double(x, data),
+      residual_fn   = function(x) double_sig_residual(x, data),
+      numVar        = ncol(bounds),
+      rangeVar      = bounds,
+      numPopulation = numPopulation,
+      max_iter_woa  = max_iter_woa,
+      div_threshold = 0.05,
+      n_lma         = 10,
+      min_dist      = 0.01,
+      verbose       = FALSE
+    )
+    list(
+      h0       = result$par[1],
+      h1       = result$par[2],
+      h2       = result$par[3],
+      a1       = result$par[4],
+      a2       = result$par[5],
+      t1       = result$par[6],
+      t2       = result$par[7],
+      best_sse = result$value
+    )
+  }, seed = seeds[i])
+
+  out$dataset_id <- i
+  out$seed       <- seeds[i]
+  out$algorithm  <- "WOA-LMA Hybrid"
+  out
+}
+
+# ── Sequential runs ────────────────────────────────────────────────────────
+tic.clearlog()
+
+tic("WOA")
+double_woa_df <- map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_double, "WOA")
+)
+toc(log = TRUE, quiet = TRUE)
+message("WOA done: ", nrow(double_woa_df), " rows")
+
+tic("WOA Lévy")
+double_levy_df <- map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_levy_double, "WOA Lévy")
+)
+toc(log = TRUE, quiet = TRUE)
+message("WOA Lévy done: ", nrow(double_levy_df), " rows")
+
+tic("WOA-LMA Hybrid")
+double_hybrid_df <- map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_hybrid_double(.x, .y)
+)
+toc(log = TRUE, quiet = TRUE)
+message("WOA-LMA Hybrid done: ", nrow(double_hybrid_df), " rows")
+
+tic("LMA with random starts")
+double_lma_df <- map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_lma_fit_double(.x, dataset_id = .y, seed = seeds[.y])
+) |>
+  mutate(algorithm = "LMA with random starts")  # fix internal label
+toc(log = TRUE, quiet = TRUE)
+message("LMA done: ", nrow(double_lma_df), " rows")
+
+# ── Combine ────────────────────────────────────────────────────────────────
+results_double <- bind_rows(
+  double_woa_df,
+  double_levy_df,
+  double_hybrid_df,
+  double_lma_df
+)
+
+# quick sanity check
+message("Total rows: ", nrow(results_double))
+message("Algorithms present: ", paste(unique(results_double$algorithm), collapse = ", "))
+message("Any NA best_sse: ", sum(is.na(results_double$best_sse)))
+print(results_double)
+```

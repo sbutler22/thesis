@@ -1,0 +1,256 @@
+---
+title: "initial_WOA"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(metaheuristicOpt)
+library(tictoc)
+```
+
+### One Variable
+Let's try to run the toy example of minimizing f(x) = (x-3)^2
+
+
+```{r}
+# define objective function
+objective <- function(x) {
+  (x[1] - 3)^2 # x[1] indexes it as the first variable
+}
+
+# define upper and lower bounds
+bounds <- matrix(c(-50, 50,
+                   -50, 50), nrow = 2, ncol = 2, byrow = FALSE)
+# run WOA
+result <- WOA(
+  FUN = objective,
+  optimType = "MIN",
+  numVar = ncol(bounds),
+  numPopulation = 5,
+  maxIter = 50,
+  rangeVar = bounds)
+
+print(result)
+```
+
+For some reason it doesn't like when I run it with only one variable, so I added a dummy variable x2. Then it does a great job estimating x1 (which should be 3) and x2 is free.
+
+### Two Variables
+Let's actually try it with two variables:
+
+```{r}
+# define objective function
+objective <- function(x) {
+  (x[1] - 3)^2 + (x[2] - 2)^2 
+}
+
+# define upper and lower bounds
+bounds <- matrix(c(-50, 50,
+                   -50, 50), nrow = 2, ncol = 2, byrow = FALSE)
+# run WOA
+result <- WOA(
+  FUN = objective,
+  optimType = "MIN",
+  numVar = ncol(bounds),
+  numPopulation = 25,
+  maxIter = 100,
+  rangeVar = bounds)
+
+print(result)
+```
+
+The answer should be (3,2). When numPopulation = 5 and maxIter = 50, I get (3.29, 1.2). When I increase numPopulation to 25 and maxIter to 100 I get the right answer.
+
+### sicegar
+
+#### nlsLM
+Now, can we do it with sicegar data??
+
+That means generating data, finding parameter estimates with LMA, and then finding corresponding SSE so that I have an idea of what the SSE should be, then trying to do it with WOA to see if we can get close.
+
+
+```{r}
+# generate data
+set.seed(47)
+
+# true values
+h0 = 30
+h1 = 750
+t1 = 160
+a = 0.05
+
+reps = 5
+disp = 250
+
+sig_formula <- function(x, h0, h1, t1, a){
+h0 + (h1 - h0) / (1 + exp(-a * (x - t1)))
+}
+
+x_vals <- rep(seq(0, 300, by = 20), times = reps)
+
+true_params <- list(h0 = h0, h1 = h1, t1 = t1, a = a)
+
+mean_vals <- rep(sig_formula(x_vals,
+                        h0 = true_params$h0,
+                        h1 = true_params$h1,
+                        t1 = true_params$t1,
+                        a = true_params$a))
+
+data <- rnorm(n = length(mean_vals), mean = mean_vals, sd = rep(disp, length(mean_vals)))
+sig_data <- data.frame(time = x_vals, intensity = data)
+
+# also want a normalized version
+norm_sig_data <- sig_data |>
+  mutate(time = ((time - min(time))/(max(time)- min(time))),
+         intensity = ((intensity - min(intensity))/(max(intensity)- min(intensity))))
+
+```
+
+Using `nlsLM`:
+
+```{r}
+# first define SSE function
+sse_func <- function(h0, h1, t1, a, data) {
+  sse <- data |>
+    mutate(preds = h0 + (h1 - h0) / (1 + exp(-a * (x - t1))),
+      diff = (y - preds)^2) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  return(sse) # i'd rather this be a vector, but this only way i can get it to work down below
+}
+```
+
+
+```{r}
+# define bounds & starting values
+startlist <- list(h0 = 0.13, h1 = 0.83, t1 = 0.53, a = 1) # changed starting values to be closer to true values
+
+# had to make bigger bounds than we used with sicegar
+lowerbounds <- c(h0 = -0.5, h1 = 0.0, t1 = -1, a = 0) 
+upperbounds <- c(h0 = 0.5, h1 = 1.5, t1 = 1.5, a = 180) 
+
+tic()
+# run nlsLM
+result <- minpack.lm::nlsLM(
+  intensity ~ sig_formula(time, h0, h1, t1, a),
+  data = norm_sig_data,
+  start = startlist,
+  control = list(maxiter = 1000, factor = 100, ptol = 1e-8, ftol = 1e-8),
+  lower = lowerbounds,
+  upper = upperbounds,
+  trace = TRUE
+)
+toc()
+# extract estimated parameters
+params <- coef(result)
+print(params)
+
+# compute SSE
+sse_val <- sse_func(
+  h0 = params["h0"],            
+  h1 = params["h1"],
+  t1 = params["t1"],
+  a  = params["a"],
+  data = norm_sig_data |> rename(x = time, y = intensity) # match column names!
+)
+
+print(sse_val)
+```
+
+Maybe we should plot just to check it:
+
+```{r}
+norm_sig_data |>
+  ggplot(aes(x = time, y = intensity)) +
+  geom_point() +
+  geom_line(aes(x = time, y = sig_formula(time, 0.1703829, 0.8272726, 0.5461193, 13.8626371)), color = "red")
+```
+
+```{r}
+# checking normalization
+# h1
+h0_norm_func <- function(data, h0) {
+  h0_norm <- (h0 - min(data$intensity))/(max(data$intensity) - min(data$intensity))
+  return(h0_norm)
+}
+
+
+# h1
+h1_norm_func <- function(data, h1) {
+  h1_norm <- (h1 - min(data$intensity))/(max(data$intensity) - min(data$intensity))
+  return(h1_norm)
+}
+
+# t1
+t1_norm_func <- function(data, t1) {
+  t1_norm <- (t1 - min(data$time))/(max(data$time) - min(data$time))
+  return(t1_norm)
+}
+
+# a
+a_norm_func <- function(data, a) {
+  a_norm <- a * (max(data$time) - min(data$time))
+  return(a_norm)
+}
+
+h0_norm_func(sig_data, h0)
+h1_norm_func(sig_data, h1)
+t1_norm_func(sig_data, t1)
+a_norm_func(sig_data, a)
+```
+
+#### WOA
+
+```{r}
+# objective function is SSE
+objective_SSE <- function(x, data) {
+  h0 <- x[1]
+  h1 <- x[2]
+  t1 <- x[3]
+  a  <- x[4]
+  
+  sse <- data |>
+    mutate(preds = h0 + (h1 - h0)/(1 + exp(-a*(time - t1))),
+           diff = (intensity - preds)^2) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  
+  return(sse)
+}
+
+# upper and lower bounds
+bounds <- matrix(c(-0.1, 0.3, -0.52, 0.01,
+                 0.3, 0.97, 1, 180), nrow = 2, ncol = 4, byrow = TRUE)
+tic()
+# run WOA
+sse_result <- WOA(
+  FUN = function(x) objective_SSE(x, norm_sig_data),
+  optimType = "MIN",
+  numVar = ncol(bounds),
+  numPopulation = 40,
+  maxIter = 500,
+  rangeVar = bounds)
+
+toc()
+
+best_sse <- objective_SSE(sse_result, norm_sig_data)
+
+print(sse_result)
+print(best_sse)
+```
+
+Now we can plot:
+
+```{r}
+norm_sig_data |>
+  ggplot(aes(x = time, y = intensity)) +
+  geom_point() +
+  geom_line(aes(x = time, y = sig_formula(time, 0.1658185, 0.8256365, 0.5442213, 14.0970407)), color = "red")
+```
+
+```{r}
+sse_diff = best_sse - sse_val
+sse_diff
+```
+

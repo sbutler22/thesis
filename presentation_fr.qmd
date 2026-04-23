@@ -1,0 +1,517 @@
+---
+title: "presentation_new"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(plotly)
+```
+
+
+# OLS
+
+```{r}
+set.seed(47)
+x <- seq(0, 20, by = 0.25)
+y_true <- 3 * x + 10
+y_noisy <- y_true + rnorm(length(x), 0 , 6)
+
+ols_df <- data.frame(x, y_noisy)
+
+ols_df |>
+  ggplot(aes(x = x, y = y_noisy)) +
+  geom_point() +
+  labs(title = "Simulated Data", x = "x", y = "y") +
+  theme_minimal()
+```
+
+
+```{r}
+ols_fit <- lm(y_noisy ~ x, data = ols_df)
+b0 <- ols_fit$coefficients[1]
+b1 <- ols_fit$coefficients[2]
+
+ols_df |>
+  ggplot(aes(x = x, y = y_noisy)) +
+  geom_point() +
+  geom_line(aes(x = x, y = b0 + b1 * x), color = "#74C8C0") +
+  labs(title = "Simulated Data with Linear Fit", x = "x", y = "y") +
+  theme_minimal()
+```
+
+
+```{r}
+# pick 5 points to highlight
+residual_points <- ols_df[c(6, 21, 40, 55, 60, 74), ]
+
+ols_df |>
+  ggplot(aes(x = x, y = y_noisy)) +
+  geom_segment(data = residual_points, aes(x = x, xend = x, y = y_noisy, yend = b0 + b1 * x),
+    color = "#D6191B", linewidth = 0.8) +
+  geom_point() +
+  geom_point(data = residual_points, color = "#D6191B") +
+  geom_line(aes(x = x, y = b0 + b1 * x), color = "#74C8C0") +
+  labs(title = "Simulated Data with Linear Fit", x = "x", y = "y") +
+  theme_minimal()
+```
+
+
+```{r}
+# create grid
+b0_seq <- seq(b0 - 20, b0 + 20, length.out = 80)
+b1_seq <- seq(b1 - 3,  b1 + 3,  length.out = 80)
+
+# compute sse across grid
+sse_matrix <- outer(b0_seq, b1_seq, FUN = function(b0, b1) {
+  sapply(seq_along(b0), function(i) {
+    residuals <- y_noisy - (b0[i] + b1[i] * x)
+    sum(residuals^2)
+  })
+})
+
+# plot
+plot_ly() |>
+  add_surface(
+    x = b1_seq,
+    y = b0_seq,
+    z = sse_matrix,
+    colorscale = list(c(0, "#2166AC"), c(0.25, "#74C8C0"), c(0.5, "#FFE81A"), c(0.75, "#F98E2B"), c(1, "#D6191B")),
+    colorbar = list(title = "SSE"),
+    contours = list(
+      z = list(
+        show      = TRUE,
+        start     = 0,
+        end       = max(sse_matrix),
+        size      = 10000,
+        color     = "white",
+        width     = 2,
+        highlight = FALSE
+      )
+    )
+  ) |>
+  add_markers(
+    x = b1,
+    y = b0,
+    z = sum(residuals(ols_fit)^2),
+    marker = list(color = "red", size = 6, symbol = "circle"),
+    name = "OLS minimum"
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = "β₁"),
+      yaxis = list(title = "β₀"),
+      zaxis = list(title = "SSE"),
+      camera = list(eye = list(x = 1.5, y = -1.8, z = 0.8))
+    ),
+    title = list(text = "SSE solution space", x = 0.05)
+  )
+```
+
+
+
+# double-sigmoidal data
+
+```{r}
+# f_base
+f0 <- function(x, B1, M1, B2, L) {
+  1 / ((1 + exp(-B1 * (x - M1))) * (1 + exp(B2 * (x - (M1 + L)))))
+}
+
+# piecewise double sigmoid
+f2_new <- function(x, A2, Ka, B1, M1, B2, L, const, argument, h0) {
+  f0_vals <- f0(x, B1, M1, B2, L)
+  H <- fBasics::Heaviside(x - argument)  # Vectorized Heaviside function
+
+  part1 <- H * (f0_vals * ((Ka - A2 * Ka) / const) + A2 * Ka)
+  part2 <- (1 - H) * (f0_vals * ((Ka - h0) / const) + h0)
+
+  return(part1 + part2)
+}
+
+# generate data
+generate_piecewise_data <- function(x_vals = seq(0, 300, by = 20), reps = 5, dispersion = 100,
+    B1 = 0.04, B2 = 0.03, M1 = 110, L = 130, h1 = 480, h2 = 240, h0 = 0) {
+  A2 <- h2 / h1
+  Ka <- h1
+
+  set.seed(101)
+  
+  # find x-value corresponding to max of f0 (which is t*)
+  x_dense <- seq(min(x_vals), max(x_vals), length.out = 1000)
+  f0_vals <- f0(x_dense, B1, M1, B2, L)
+  argument <- x_dense[which.max(f0_vals)]
+
+  # const = f0
+  const <- f0(argument, B1, M1, B2, L) # argument because max(f0) is at t*
+
+  # add reps to x and y
+  x_repeated <- rep(x_vals, each = reps)
+  y_true <- f2_new(x_repeated, A2, Ka, B1, M1, B2, L, const, argument, h0)
+  y_noisy <- rnorm(length(y_true), mean = y_true, sd = dispersion)
+
+  # make df
+  df <- data.frame(
+    time = x_repeated,
+    intensity = y_noisy
+  )
+  
+  # plot
+  plot <- df|>
+    ggplot(aes(x = time, y = intensity)) +
+    geom_point() +
+    geom_vline(aes(xintercept = argument), color = "red")
+  
+  return(df)
+}
+
+dub_sig_data <- generate_piecewise_data()
+
+```
+
+```{r}
+library(sicegar)
+
+# normalize the data first (sicegar requirement)
+normalized_data <- normalizeData(
+  dataInput = dub_sig_data,
+  dataInputName = "dub_sig_data"
+)
+
+# fit the double sigmoidal model
+double_sig_fit <- doublesigmoidalFitFunction_h0(
+  dataInput = normalized_data,
+  tryCounter = 500  # number of random starting points to try
+)
+
+```
+
+
+
+```{r}
+# double sigmoidal data
+normalized_data$timeIntensityData |>
+  ggplot(aes(x = time, y = intensity)) + 
+  geom_point() +
+  theme_minimal() +
+  labs(x = "x", y = "y", title = "Simulated Nonlinear Data")
+```
+
+```{r}
+# double sigmoidal data with fit
+# generate fitted curve from parameters
+fitted_curve <- sicegar::doublesigmoidalFitFormula_h0(
+  x         = seq(0, 300, by = 1),
+  finalAsymptoteIntensityRatio = double_sig_fit$finalAsymptoteIntensityRatio_Estimate,
+  maximum                      = double_sig_fit$maximum_Estimate,
+  slope1Param                  = double_sig_fit$slope1Param_Estimate,
+  midPoint1Param               = double_sig_fit$midPoint1Param_Estimate,
+  slope2Param                  = double_sig_fit$slope2Param_Estimate,
+  midPointDistanceParam        = double_sig_fit$midPointDistanceParam_Estimate,
+  h0                           = double_sig_fit$h0_Estimate)
+
+fitted_df <- data.frame(time = seq(0, 300, by = 1), intensity = fitted_curve)
+
+dub_sig_data |>
+  ggplot(aes(x = time, y = intensity)) +
+  geom_point() +
+  geom_line(data = fitted_df, aes(x = time, y = intensity), color = "#74C8C0", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "x", y = "y", title = "Double Sigmoidal Fit")
+```
+
+
+```{r}
+# true parameter values from data generation
+B1 <- 0.04; B2 <- 0.03; M1 <- 110; L <- 130
+h1 <- 480;  h2 <- 240;  h0 <- 0
+Ka <- h1
+A2 <- h2 / h1
+
+fitted_curve_true <- doublesigmoidalFitFormula_h0(
+  x                            = seq(0, 300, by = 1),
+  finalAsymptoteIntensityRatio = A2,
+  maximum                      = Ka,
+  slope1Param                  = B1,
+  midPoint1Param               = M1,
+  slope2Param                  = B2,
+  midPointDistanceParam        = L,
+  h0                           = h0
+)
+
+fitted_df_true <- data.frame(time = seq(0, 300, by = 1), intensity = fitted_curve_true)
+
+dub_sig_data |>
+  ggplot(aes(x = time, y = intensity)) +
+  geom_point() +
+  geom_line(data = fitted_df_true, aes(x = time, y = intensity), color = "#74C8C0", linewidth = 1) +
+  theme_minimal() +
+  labs(x = "x", y = "y", title = "Double Sigmoidal Fit")
+```
+
+# LMA
+```{r}
+# true min from the fit
+b0_min <- 7.719172
+b1_min <- 3.271829
+
+# starting point
+b0_start <- -7
+b1_start <- 1
+
+# simulate lma path
+n_steps <- 30
+damping  <- 0.85  # controls how quickly it converges
+
+b0_path <- numeric(n_steps)
+b1_path <- numeric(n_steps)
+b0_path[1] <- b0_start
+b1_path[1] <- b1_start
+
+for (i in 2:n_steps) {
+  b0_path[i] <- b0_min + (b0_path[i-1] - b0_min) * damping
+  b1_path[i] <- b1_min + (b1_path[i-1] - b1_min) * damping
+}
+
+# compute sse along the path
+sse_path <- sapply(seq_along(b0_path), function(i) {
+  residuals <- y_noisy - (b0_path[i] + b1_path[i] * x)
+  sum(residuals^2)
+})
+
+# grid
+b0_seq <- seq(b0_min - 20, b0_min + 20, length.out = 80)
+b1_seq <- seq(b1_min - 3,  b1_min + 3,  length.out = 80)
+
+sse_matrix <- outer(b0_seq, b1_seq, FUN = function(b0, b1) {
+  sapply(seq_along(b0), function(i) {
+    residuals <- y_noisy - (b0[i] + b1[i] * x)
+    sum(residuals^2)
+  })
+})
+
+# plot
+plot_ly() |>
+  add_surface(
+    x = b1_seq,
+    y = b0_seq,
+    z = sse_matrix,
+    colorscale = list(c(0, "#2166AC"), c(0.25, "#74C8C0"), c(0.5, "#FFE81A"), c(0.75, "#F98E2B"), c(1, "#D6191B")),
+    colorbar = list(title = "SSE"),
+    contours = list(
+      z = list(
+        show      = TRUE,
+        start     = 0,
+        end       = max(sse_matrix),
+        size      = 10000,
+        color     = "white",
+        width     = 2,
+        highlight = FALSE
+      )
+    ),
+    opacity = 0.85
+  ) |>
+  add_paths(
+    x = b1_path,
+    y = b0_path,
+    z = sse_path + 200,   # slight offset so path sits above surface
+    line = list(color = "violet", width = 5),
+    name = "LM path"
+  ) |>
+  add_markers(
+    x = b1_path[1],
+    y = b0_path[1],
+    z = sse_path[1] + 200,
+    marker = list(color = "white", size = 7, symbol = "circle"),
+    name = "Start"
+  ) |>
+  add_markers(
+    x = b1_min,
+    y = b0_min,
+    z = min(sse_path) + 200,
+    marker = list(color = "red", size = 7, symbol = "circle"),
+    name = "Minimum"
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = "β₁"),
+      yaxis = list(title = "β₀"),
+      zaxis = list(title = "SSE"),
+      camera = list(eye = list(x = 1.5, y = -1.8, z = 0.8))
+    ),
+    title = list(text = "LMA Optimisation Path", x = 0.05)
+  )
+```
+
+
+# rastrigin
+
+```{r}
+# --- Rastrigin function ---
+rastrigin <- function(x, y, A = 10) {
+  A * 2 + (x^2 - A * cos(2 * pi * x)) + (y^2 - A * cos(2 * pi * y))
+}
+
+# --- Grid ---
+x_seq <- seq(-5.12, 5.12, length.out = 200)
+y_seq <- seq(-5.12, 5.12, length.out = 200)
+
+z_matrix <- outer(x_seq, y_seq, FUN = rastrigin)
+
+# --- Plot ---
+plot_ly() |>
+  add_surface(
+    x = x_seq,
+    y = y_seq,
+    z = z_matrix,
+    colorscale = list(
+      c(0, "#2166AC"), c(0.25, "#74C8C0"),
+      c(0.5, "#FFE81A"), c(0.75, "#F98E2B"),
+      c(1, "#D6191B")
+    ),
+    colorbar = list(title = "f(x, y)"),
+    contours = list(
+      z = list(
+        show      = TRUE,
+        start     = 0,
+        end       = max(z_matrix),
+        size      = 10,
+        color     = "white",
+        width     = 1,
+        highlight = FALSE
+      )
+    )
+  ) |>
+  layout(
+    scene = list(
+      xaxis = list(title = "x"),
+      yaxis = list(title = "y"),
+      zaxis = list(title = "f(x, y)"),
+      camera = list(eye = list(x = 1.5, y = -1.8, z = 1.2))
+    ),
+    title = list(text = "Rastrigin function", x = 0.05)
+  )
+```
+
+
+
+# narrow canyon
+
+```{r}
+library(plotly)
+
+# ============================================================
+# 3D narrow canyon surface
+# ============================================================
+
+x <- seq(-3, 3, length.out = 200)
+y <- seq(-3, 3, length.out = 200)
+
+canyon_z <- function(x, y) {
+  depth  <- 3
+  width  <- 0.15
+  -depth * exp(-x^2 / (2 * width^2))
+}
+
+z <- outer(x, y, canyon_z)
+
+custom_colorscale <- list(
+  c(0, "#2166AC"), c(0.25, "#74C8C0"),
+  c(0.5, "#FFE81A"), c(0.75, "#F98E2B"), c(1, "#8B3A00"))
+
+# ============================================================
+# PLOT 1: surface only
+# ============================================================
+plot1 <- plot_ly(
+  x = x, y = y, z = z,
+  type       = "surface",
+  colorscale = custom_colorscale,
+  showscale  = FALSE
+) |>
+  layout(
+    title = "Narrow Canyon",
+    scene = list(
+      xaxis  = list(title = "x"),
+      yaxis  = list(title = "y"),
+      zaxis  = list(title = "z"),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.2))
+    )
+  )
+
+plot1
+```
+
+
+with grid...
+
+```{r}
+# ============================================================
+# PLOT 2: surface + 25 red dots in a 5x5 grid
+# ============================================================
+
+grid_x <- seq(-2.5, 2.5, length.out = 5)
+grid_y <- seq(-2.5, 2.5, length.out = 5)
+grid   <- expand.grid(x = grid_x, y = grid_y)
+grid$z <- canyon_z(grid$x, grid$y)
+
+plot2 <- plot_ly(
+  x = x, y = y, z = z,
+  type       = "surface",
+  colorscale = custom_colorscale,
+  showscale  = FALSE,
+  opacity    = 0.9
+) |>
+  add_trace(
+    data   = grid,
+    x      = ~y,
+    y      = ~x,
+    z      = ~z,
+    type   = "scatter3d",
+    mode   = "markers",
+    marker = list(
+      color  = "red",
+      size   = 6,
+      symbol = "circle"
+    ),
+    name = "grid points"
+  ) |>
+  layout(
+    title = "Narrow Canyon — Grid Points",
+    scene = list(
+      xaxis  = list(title = "x"),
+      yaxis  = list(title = "y"),
+      zaxis  = list(title = "z"),
+      camera = list(eye = list(x = 1.8, y = 1.8, z = 1.2))
+    )
+  )
+
+plot2
+```
+
+
+
+
+# hybrid
+
+```{r}
+x = seq(0,20, 0.01)
+y = (x-10)^2
+
+parab = tibble(x,y)
+
+parab |>
+  ggplot(aes(x = x, y = y)) +
+  geom_line() +
+  theme_minimal()
+```
+
+
+
+
+
+
+
+
+
+
+

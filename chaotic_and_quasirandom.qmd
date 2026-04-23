@@ -1,0 +1,1172 @@
+---
+title: "chaotic_mapping"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tictoc)
+library(metaheuristicOpt)
+
+```
+
+
+
+I am going to replace r in the engineWOA with a cubic map ideally. That means for each r_i calculated, i will use f(x_i) where f(x) = map.
+
+
+```{r}
+engineWOA_chaotic <- function(FUN, optimType, maxIter, lowerBound, upperBound, whale) {
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+
+  # chaotic map
+  chaotic_map <- function(x) 4 * x^3 - 3 * x
+  
+  # function to move range from (-1,1) to (0,1)
+  to_unit <- function(x) (x + 1) / 2
+  
+  # starting value for r1, r2 - (-1,1) because that is domain of the map
+  r1_val <- runif(1, -1, 1)
+  r2_val <- runif(1, -1, 1)
+ 
+  # back to regular function
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2) / maxIter)
+    a2 <- -1 + t * ((-1) / maxIter)
+
+    for (i in 1:nrow(whale)) {
+
+      # update chaotic values
+      r1_val <- chaotic_map(r1_val)
+      r2_val <- chaotic_map(r2_val)
+      
+
+      # scale to [0,1]
+      r1 <- to_unit(r1_val)
+      r2 <- to_unit(r2_val)
+      
+
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      p  <- runif(1)
+      l  <- (a2 - 1) * runif(1) + 1
+
+
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * to_unit(chaotic_map(r1_val)) + 1)
+            x.rand <- whale[rand.index, ]
+            D.x.rand <- abs(C * x.rand[j] - whale[i, j])
+            whale[i, j] <- x.rand[j] - A * D.x.rand
+          } else {
+            D.bestPos <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D.bestPos
+          }
+        } else {
+          distance <- abs(bestPos[j] - whale[i, j])
+          whale[i, j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+
+```
+
+Then new WOA function to call that one:
+
+First we need to define this generateRandom(), calcFitness(), checkBound() functions, so I've just copied them from the og package.
+
+```{r}
+generateRandom <- function (numPopulation, dimension, lowerBound, upperBound) 
+{
+    result <- matrix()
+    if (length(lowerBound) == 1) {
+        result <- matrix(runif(numPopulation * dimension, lowerBound, 
+            upperBound), nrow = numPopulation, ncol = dimension)
+    }
+    else {
+        result <- matrix(nrow = numPopulation, ncol = dimension)
+        for (i in 1:dimension) {
+            result[, i] = runif(numPopulation, lowerBound[i], 
+                upperBound[i])
+        }
+    }
+    return(result)
+}
+```
+
+
+```{r}
+calcFitness <- function (FUN, optimType, popu) 
+{
+    fitness <- c()
+    for (i in 1:nrow(popu)) {
+        fitness[i] <- optimType * FUN(popu[i, ])
+    }
+    return(fitness)
+}
+```
+
+```{r}
+checkBound <- function (position, lowerBound, upperBound) 
+{
+    check1 <- position > upperBound
+    check2 <- position < lowerBound
+    result <- (position * (!(check1 + check2))) + upperBound * 
+        check1 + lowerBound * check2
+    return(result)
+}
+```
+
+
+
+```{r}
+WOA_chaotic <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+  maxIter = 500, rangeVar) 
+{
+  dimension <- ncol(rangeVar)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  if (optimType == "MAX") 
+    optimType <- -1
+  else optimType <- 1
+  whale <- generateRandom(numPopulation, dimension, lowerBound, 
+    upperBound)
+  bestPos <- engineWOA_chaotic(FUN, optimType, maxIter, lowerBound, 
+    upperBound, whale)
+  return(bestPos)
+}
+```
+
+Now try it on an easy sicegar problem:
+
+First generate data:
+
+```{r}
+# generate data
+set.seed(47)
+
+# true values
+h0 = 30
+h1 = 750
+t1 = 160
+a = 0.05
+
+reps = 5
+disp = 250
+
+sig_formula <- function(x, h0, h1, t1, a){
+h0 + (h1 - h0) / (1 + exp(-a * (x - t1)))
+}
+
+x_vals <- rep(seq(0, 300, by = 20), times = reps)
+
+true_params <- list(h0 = h0, h1 = h1, t1 = t1, a = a)
+
+mean_vals <- rep(sig_formula(x_vals,
+                        h0 = true_params$h0,
+                        h1 = true_params$h1,
+                        t1 = true_params$t1,
+                        a = true_params$a))
+
+data <- rnorm(n = length(mean_vals), mean = mean_vals, sd = rep(disp, length(mean_vals)))
+sig_data <- data.frame(time = x_vals, intensity = data)
+
+# also want a normalized version
+norm_sig_data <- sig_data |>
+  mutate(time = ((time - min(time))/(max(time)- min(time))),
+         intensity = ((intensity - min(intensity))/(max(intensity)- min(intensity))))
+
+```
+
+
+
+
+```{r}
+# objective function is SSE
+objective_SSE <- function(x, data) {
+  h0 <- x[1]
+  h1 <- x[2]
+  t1 <- x[3]
+  a  <- x[4]
+  
+  sse <- data |>
+    mutate(preds = h0 + (h1 - h0)/(1 + exp(-a*(time - t1))),
+           diff = (intensity - preds)^2) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  
+  return(sse)
+}
+
+# upper and lower bounds
+bounds <- matrix(c(-0.1, 0.3, -0.52, 0.01,
+                 0.35, 0.97, 1, 180), nrow = 2, ncol = 4, byrow = TRUE)
+
+# run WOA_chaotic
+run_WOA_chaotic <- function(data) {
+  # running WOA_chaotic
+  sse_result <- WOA_chaotic(
+    FUN = function(x) objective_SSE(x, data),
+    optimType = "MIN",
+    numVar = ncol(bounds),
+    numPopulation = 40,
+    maxIter = 500,
+    rangeVar = bounds
+  )
+  
+  # compute best SSE at that solution
+  best_sse <- objective_SSE(sse_result, data)
+  
+  # return both
+  list(
+    h0 = sse_result[1],
+    h1 = sse_result[2],
+    t1 = sse_result[3],
+    a  = sse_result[4],
+    best_sse = best_sse
+  )
+}
+tic()
+run_WOA_chaotic(norm_sig_data)
+toc()
+
+```
+Some of the time this does as well as the original algorithm. I've loaded in all the functions from WOA, but it still hits errors sometimes, but maybe this is leading to bad estimations (like if some of the helper functions need to be changed. The rest of the time it gives reasonable estimates, but seems to overestimate $a$ most frequently. 
+
+# quasi-random numbers
+
+```{r}
+library(randtoolbox)
+```
+
+```{r}
+engineWOA_quasirandom <- function(FUN, optimType, maxIter, lowerBound, upperBound, whale) {
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+
+  # quasi-random sobol sequence
+  dim_needed <- 2   # r1, r2
+  sobol_seq <- sobol(n = maxIter, dim = dim_needed, scrambling = 0)
+
+ 
+  # back to regular function
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2) / maxIter)
+    a2 <- -1 + t * ((-1) / maxIter)
+
+    for (i in 1:nrow(whale)) {
+
+    r1 <- sobol_seq[t, 1]
+    r2 <- sobol_seq[t, 2]
+      
+
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      p  <- runif(1)
+      l  <- (a2 - 1) * runif(1) + 1
+
+
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * r1) + 1            
+            x.rand <- whale[rand.index, ]
+            D.x.rand <- abs(C * x.rand[j] - whale[i, j])
+            whale[i, j] <- x.rand[j] - A * D.x.rand
+          } else {
+            D.bestPos <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D.bestPos
+          }
+        } else {
+          distance <- abs(bestPos[j] - whale[i, j])
+          whale[i, j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+
+```
+
+
+```{r}
+WOA_quasirandom <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+  maxIter = 500, rangeVar) 
+{
+  dimension <- ncol(rangeVar)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  if (optimType == "MAX") 
+    optimType <- -1
+  else optimType <- 1
+  whale <- generateRandom(numPopulation, dimension, lowerBound, 
+    upperBound)
+  bestPos <- engineWOA_quasirandom(FUN, optimType, maxIter, lowerBound, 
+    upperBound, whale)
+  return(bestPos)
+}
+```
+
+Test it:
+
+```{r}
+bounds <- matrix(c(-0.1, 0.3, -0.52, 0.01,
+                 0.35, 0.97, 1, 180), nrow = 2, ncol = 4, byrow = TRUE)
+
+# run WOA_quasirandom
+run_WOA_quasirandom <- function(data) {
+  # running WOA_quasirandom
+  sse_result <- WOA_quasirandom(
+    FUN = function(x) objective_SSE(x, data),
+    optimType = "MIN",
+    numVar = ncol(bounds),
+    numPopulation = 40,
+    maxIter = 500,
+    rangeVar = bounds
+  )
+  
+  # compute best SSE at that solution
+  best_sse <- objective_SSE(sse_result, data)
+  
+  # return both
+  list(
+    h0 = sse_result[1],
+    h1 = sse_result[2],
+    t1 = sse_result[3],
+    a  = sse_result[4],
+    best_sse = best_sse
+  )
+}
+tic()
+run_WOA_quasirandom(norm_sig_data)
+toc()
+```
+# testing function
+
+I want to map different datasets accross the three to see how they do. This is using 250 dispersion.
+
+```{r}
+data_gen_func <- function(h0 = 30, h1 = 750, t1 = 160, a = 0.05, reps = 5, disp = 250){
+  
+
+sig_formula <- function(x, h0, h1, t1, a){
+h0 + (h1 - h0) / (1 + exp(-a * (x - t1)))
+}
+
+x_vals <- rep(seq(0, 300, by = 20), times = reps)
+
+true_params <- list(h0 = h0, h1 = h1, t1 = t1, a = a)
+
+mean_vals <- rep(sig_formula(x_vals,
+                        h0 = true_params$h0,
+                        h1 = true_params$h1,
+                        t1 = true_params$t1,
+                        a = true_params$a))
+
+data <- rnorm(n = length(mean_vals), mean = mean_vals, sd = rep(disp, length(mean_vals)))
+sig_data <- data.frame(time = x_vals, intensity = data)
+
+# also want a normalized version
+norm_sig_data <- sig_data |>
+  mutate(time = ((time - min(time))/(max(time)- min(time))),
+         intensity = ((intensity - min(intensity))/(max(intensity)- min(intensity))))
+}
+```
+
+Quickly define `run_WOA` function.
+
+```{r}
+bounds <- matrix(c(-0.1, 0.3, -0.52, 0.01,
+                 0.35, 0.97, 1, 180), nrow = 2, ncol = 4, byrow = TRUE)
+
+# run WOA_quasirandom
+run_WOA <- function(data) {
+  # running WOA
+  sse_result <- WOA(
+    FUN = function(x) objective_SSE(x, data),
+    optimType = "MIN",
+    numVar = ncol(bounds),
+    numPopulation = 40,
+    maxIter = 500,
+    rangeVar = bounds
+  )
+  
+  # compute best SSE at that solution
+  best_sse <- objective_SSE(sse_result, data)
+  
+  # return both
+  list(
+    h0 = sse_result[1],
+    h1 = sse_result[2],
+    t1 = sse_result[3],
+    a  = sse_result[4],
+    best_sse = best_sse
+  )
+}
+tic()
+run_WOA(norm_sig_data)
+toc()
+```
+
+In the code below, since future_map() operates in multiple R sessions, we have to be really careful with the random number generation, because they might not be random relative to each other. The warning I kept getting was:
+
+Warning: UNRELIABLE VALUE: Future (NULL) unexpectedly generated random numbers without specifying argument 'seed'. There is a risk that those random numbers are not statistically sound and the overall results might be invalid. To fix this, specify 'seed=TRUE'. This ensures that proper, parallel-safe random numbers are produced. To disable this check, use 'seed=NULL', or set option 'future.rng.onMisuse' to "ignore".
+
+The warning is because the various WOA functions randomly generate numbers internally and the `set.seed()` doesn't flow through the whole process. So the different workers might generate random numbers from the same sequences. I solved this by using the function `withSeed()` from the R.utils package. This sets the seed for both the map and down through the runifs in WOA. I also have the argument `seed = TRUE` in each function which should ensure independence in the random number generation in each function
+
+```{r}
+library(furrr)
+library(R.utils)
+
+plan(multisession, workers = 5)  # i have 8 total
+
+seeds <- 1:250 
+
+# generate the data with given seeds
+generated_data <- map(seeds, function(s) {
+  set.seed(s)
+  data_gen_func()
+})
+
+# define bounds
+bounds <- matrix(c(-0.1, 0.3,
+                   -0.52, 0.01,
+                   0.35, 0.97,
+                   1, 180),
+                 nrow = 2, ncol = 4, byrow = TRUE)
+
+# helper function to run everything smoothly in parallel
+run_woa_parallel <- function(data, i, algo_func, algo_name) {
+  out <- withSeed({
+    algo_func(data)
+  }, seed = seeds[i])  # ensures all random numbers inside algo_func are reproducible
+
+  out$dataset_id <- i
+  out$seed <- seeds[i]
+  out$algorithm <- algo_name
+  out
+}
+
+# og WOA
+og_df <- future_map2_dfr(
+  generated_data, seq_along(generated_data),
+  ~ run_woa_parallel(.x, .y, run_WOA, "WOA"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+
+# chaotic WOA
+chaotic_df <- future_map2_dfr(
+  generated_data, seq_along(generated_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_chaotic, "WOA_chaotic"),
+  seed = TRUE
+)
+
+# quasirandom WOA
+quasi_df <- future_map2_dfr(
+  generated_data, seq_along(generated_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_quasirandom, "WOA_quasirandom"),
+  seed = TRUE
+)
+
+# combine
+all_results <- bind_rows(og_df, chaotic_df, quasi_df)
+
+```
+
+# LMA
+
+I should LMA on the same 250 datasets, then cbind it to all_results.
+
+```{r}
+# first define SSE function
+sse_func <- function(h0, h1, t1, a, data) {
+  sse <- data |>
+    mutate(preds = h0 + (h1 - h0) / (1 + exp(-a * (x - t1))),
+      diff = (y - preds)^2) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  return(sse) # i'd rather this be a vector, but this only way i can get it to work down below
+}
+
+# and sig_formula
+sig_formula <- function(x, h0, h1, t1, a){
+h0 + (h1 - h0) / (1 + exp(-a * (x - t1)))
+}
+```
+
+
+```{r}
+library(minpack.lm)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+# Define the fitting function
+run_lma_fit <- function(data, dataset_id, seed) {
+  # define bounds & starting values
+   startlist <- list(h0 = 0.15, h1 = 0.75, t1 = 0.25, a = 90)
+   lowerbounds <- c(h0 = -0.1, h1 = 0.3, t1 = -52, a = 0.01)
+   upperbounds <- c(h0 = 0.35,  h1 = 0.97, t1 = 1, a = 180)
+
+  # safely run LMA in case of convergence errors
+  safe_nlsLM <- purrr::safely(minpack.lm::nlsLM, otherwise = NULL)
+  
+  result <- safe_nlsLM(
+    intensity ~ sig_formula(time, h0, h1, t1, a),
+    data = data,
+    start = startlist,
+    control = list(maxiter = 1000, factor = 100, ptol = 1e-8, ftol = 1e-8),
+    lower = lowerbounds,
+    upper = upperbounds,
+    trace = FALSE
+  )
+  
+  # If it failed, return NA row
+  if (is.null(result$result)) {
+    return(tibble(
+      dataset_id = dataset_id,
+      seed = seed,
+      h0 = NA, h1 = NA, t1 = NA, a = NA,
+      best_sse = NA,
+      algorithm = "LMA"
+    ))
+  }
+  
+  # extract estimated parameters
+  params <- coef(result$result)
+  
+  # compute SSE
+  sse_val <- sse_func(
+    h0 = params["h0"],            
+    h1 = params["h1"],
+    t1 = params["t1"],
+    a  = params["a"],
+    data = data |> rename(x = time, y = intensity)
+  )
+  
+  # return as tibble
+  tibble(
+    h0 = params["h0"],
+    h1 = params["h1"],
+    t1 = params["t1"],
+    a  = params["a"],
+    best_sse = sse_val,
+    dataset_id = dataset_id,
+    seed = seed,
+    algorithm = "LMA"
+  )
+}
+
+tic()
+# Run LMA fits on all datasets
+lma_results_df <- map2_dfr(generated_data, seeds, ~run_lma_fit(.x, dataset_id = which(seeds == .y), seed = .y))
+toc()
+
+# View results
+print(lma_results_df)
+
+```
+
+```{r}
+# now i want to combine the dataframes with WOA and LMA
+all_results <- rbind(all_results, lma_results_df)
+
+```
+
+
+
+ true values are h0 = 0.1386869, h1 = 0.8337327, t1 = 0.5333333, a = 15
+
+
+```{r}
+all_results |>
+  ggplot(aes(x = h0, y = t1)) +
+  geom_point(aes(color = algorithm)) +
+  geom_hline(yintercept = 0.53, color = "red") +
+  geom_vline(xintercept = 0.15, color = "red") +
+  facet_wrap(~algorithm)
+```
+
+Almost always overestimates h0 - even looks like it's hitting the upperbound pretty frequently. t1 seems like it is reasonably distributed around the truth. Also, all three algorithms look really similar.
+
+```{r}
+all_results |>
+  filter(h0 == 0.35) |>
+  summarise(h0_hit_upperbound = n())
+
+121/750
+```
+
+
+```{r}
+all_results |>
+  ggplot(aes(x = a, y = h1)) +
+  geom_point(aes(color = algorithm)) +
+  geom_hline(yintercept = 0.83, color = "red") +
+  geom_vline(xintercept = 15, color = "red") +
+  facet_wrap(~algorithm)
+```
+
+h1 is consistently underestimated, except for when a is underestimated (interesting). Most of the estimations for a look pretty good.
+
+```{r}
+lowest_sse_df <- all_results |>
+  group_by(dataset_id) |>
+  mutate(lowest_sse = min(best_sse)) |>
+  filter(best_sse == lowest_sse) |>
+  select(dataset_id, algorithm, lowest_sse)
+
+lowest_sse_df |>
+  group_by(algorithm) |>
+  summarise(count = n())
+
+```
+
+## dispersion 400
+
+```{r}
+library(furrr)
+library(R.utils)
+
+seeds <- 1:250 
+
+# generate the data with given seeds
+generated_data_400 <- map(seeds, function(s) {
+  set.seed(s)
+  data_gen_func(disp = 400) # change dispersion here
+})
+
+# define bounds
+bounds <- matrix(c(-0.1, 0.3,
+                   -0.52, 0.01,
+                   0.35, 0.97, # this should maybe be 0.3 lower bound for h1
+                   1, 180),
+                 nrow = 2, ncol = 4, byrow = TRUE)
+
+# helper function to run everything smoothly in parallel
+run_woa_parallel <- function(data, i, algo_func, algo_name) {
+  out <- withSeed({
+    algo_func(data)
+  }, seed = seeds[i])  # ensures all random numbers inside algo_func are reproducible
+
+  out$dataset_id <- i
+  out$seed <- seeds[i]
+  out$algorithm <- algo_name
+  out
+}
+
+# og WOA
+og_df_400 <- future_map2_dfr(
+  generated_data_400, seq_along(generated_data_400),
+  ~ run_woa_parallel(.x, .y, run_WOA, "WOA"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+
+# chaotic WOA
+chaotic_df_400 <- future_map2_dfr(
+  generated_data_400, seq_along(generated_data_400),
+  ~ run_woa_parallel(.x, .y, run_WOA_chaotic, "WOA_chaotic"),
+  seed = TRUE
+)
+
+# quasirandom WOA
+quasi_df_400 <- future_map2_dfr(
+  generated_data_400, seq_along(generated_data_400),
+  ~ run_woa_parallel(.x, .y, run_WOA_quasirandom, "WOA_quasirandom"),
+  seed = TRUE
+)
+
+# combine
+all_results_400 <- bind_rows(og_df_400, chaotic_df_400, quasi_df_400)
+
+```
+
+Now with LMA:
+
+```{r}
+tic()
+# Run LMA fits on all datasets
+lma_results_df_400 <- map2_dfr(generated_data_400, seeds, ~run_lma_fit(.x, dataset_id = which(seeds == .y), seed = .y))
+toc()
+
+# View results
+print(lma_results_df_400)
+```
+
+```{r}
+# now combine the LMA df with the WOA df
+all_results_400 <- rbind(all_results_400, lma_results_df_400)
+```
+
+
+
+
+true values are h0 = 0.1386869, h1 = 0.8337327, t1 = 0.5333333, a = 15
+
+
+```{r}
+all_results_400 |>
+  ggplot(aes(x = h0, y = t1)) +
+  geom_point(aes(color = algorithm)) +
+  geom_hline(yintercept = 0.53, color = "red") +
+  geom_vline(xintercept = 0.15, color = "red") +
+  facet_wrap(~algorithm)
+```
+
+The bounds are different: lma can estimate h0 up to 0.5...
+
+```{r}
+all_results_400 |>
+  filter(h0 == 0.35) |>
+  summarise(h0_hit_upperbound = n())
+
+316/750
+```
+
+
+```{r}
+all_results_400 |>
+  ggplot(aes(x = a, y = h1)) +
+  geom_point(aes(color = algorithm)) +
+  geom_hline(yintercept = 0.83, color = "red") +
+  geom_vline(xintercept = 15, color = "red") +
+  facet_wrap(~algorithm)
+```
+
+h1 is consistently underestimated, except for some instances when a is underestimated (interesting). Estimation for a are kind of all over the place
+
+```{r}
+lowest_sse_df_400 <- all_results_400 |>
+  group_by(dataset_id) |>
+  mutate(lowest_sse = min(best_sse)) |>
+  filter(best_sse == lowest_sse) |>
+  select(dataset_id, algorithm, lowest_sse)
+
+lowest_sse_df_400 |>
+  group_by(algorithm) |>
+  summarise(count = n())
+
+```
+
+
+# double-sigmoidal data
+
+```{r}
+# f_base
+f0 <- function(x, B1, M1, B2, L) {
+  1 / ((1 + exp(-B1 * (x - M1))) * (1 + exp(B2 * (x - (M1 + L)))))
+}
+
+# piecewise double sigmoid
+
+f2_h0 <- function (x, A2, Ka, B1, M1, B2, L, const, argument, h0){
+  fBasics::Heaviside(x - argument) * (f0(x, B1, M1, B2, L) * ((Ka - A2 * Ka)/(const)) + A2 * Ka) +
+    (1 - fBasics::Heaviside(x - argument)) * (f0(x, B1, M1, B2, L) * ((Ka - h0)/(const)) + h0) }
+
+
+```
+
+
+```{r}
+# generate data
+generate_piecewise_data <- function(x_vals = seq(0, 300, by = 20), reps = 5, dispersion = 100,
+    B1 = 0.04, B2 = 0.03, M1 = 110, L = 130, h1 = 480, h2 = 240, h0 = 0) {
+  A2 <- h2 / h1
+  Ka <- h1
+
+  # set.seed(101)
+  
+  # find x-value corresponding to max of f0 (which is t*)
+  x_dense <- seq(min(x_vals), max(x_vals), length.out = 1000)
+  f0_vals <- f0(x_dense, B1, M1, B2, L)
+  argument <- x_dense[which.max(f0_vals)]
+
+  # const = f0
+  const <- f0(argument, B1, M1, B2, L) # argument because max(f0) is at t*
+
+  # add reps to x and y
+  x_repeated <- rep(x_vals, each = reps)
+  y_true <- f2_h0(x_repeated, A2, Ka, B1, M1, B2, L, const, argument, h0)
+  y_noisy <- rnorm(length(y_true), mean = y_true, sd = dispersion)
+
+  # make df
+  df <- data.frame(
+    time = x_repeated,
+    intensity = y_noisy)
+    
+  norm_df <- df |>
+  mutate(time = ((time - min(time))/(max(time)- min(time))),
+         intensity = ((intensity - min(intensity))/(max(intensity)- min(intensity))))
+  
+  return(norm_df)
+  
+}
+```
+
+Objective Function
+
+```{r}
+objective_SSE_double <- function(x, data) {
+  h0 <- x[1]
+  h1 <- x[2]
+  h2 <- x[3]
+  a1 <- x[4]
+  a2 <- x[5]
+  t1 <- x[6]
+  t2 <- x[7]
+  
+  sse <- data |>
+    mutate(
+      preds = h0 +
+              (h1 - h0) / (1 + exp(-a1 * (time - t1))) +
+              (h1 - h2) / (1 + exp(-a2 * (time - t2))),
+      diff = (intensity - preds)^2
+    ) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  
+  return(sse)
+}
+
+```
+
+
+```{r}
+
+seeds <- 1:250 
+
+# generate the data with given seeds
+double_sig_data <- map(seeds, function(s) {
+  set.seed(s)
+  generate_piecewise_data()
+})
+
+# define bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48,
+                   0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79), nrow = 2, byrow = TRUE)
+
+
+# helper function to run everything smoothly in parallel
+run_woa_parallel <- function(data, i, algo_func, algo_name) {
+  out <- withSeed({
+    algo_func(data)
+  }, seed = seeds[i])  # ensures all random numbers inside algo_func are reproducible
+
+  out$dataset_id <- i
+  out$seed <- seeds[i]
+  out$algorithm <- algo_name
+  out
+}
+
+# og WOA
+double_og_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA, "WOA"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+
+# chaotic WOA
+double_chaotic_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_chaotic, "WOA_chaotic"),
+  seed = TRUE
+)
+
+# quasirandom WOA
+double_quasi_df <- future_map2_dfr(
+  double_sig_data, seq_along(double_sig_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_quasirandom, "WOA_quasirandom"),
+  seed = TRUE
+)
+
+# combine
+all_results_double <- bind_rows(double_og_df, double_chaotic_df, double_quasi_df)
+
+```
+This is taking forever to run, so let me try to run just one:
+
+```{r}
+# define data
+set.seed(47)
+double_data <- generate_piecewise_data()
+
+# objective function is SSE
+objective_SSE_double <- function(x, data) {
+  h0 <- x[1]
+  h1 <- x[2]
+  h2 <- x[3]
+  a1 <- x[4]
+  a2 <- x[5]
+  t1 <- x[6]
+  t2 <- x[7]
+  
+  sse <- data |>
+    mutate(
+      preds = h0 +
+              (h1 - h0) / (1 + exp(-a1 * (time - t1))) +
+              (h1 - h2) / (1 + exp(-a2 * (time - t2))),
+      diff = (intensity - preds)^2
+    ) |>
+    summarize(sse = sum(diff)) |>
+    pull()
+  
+  return(sse)
+}
+
+# upper and lower bounds
+bounds <- matrix(c(-0.10,  0.30, 0.00,   0.01,   0.01,  -0.52, -0.48, # this messes up midpoint distance
+                   0.30,  0.97, 1.00, 180.00, 180.00,   1.15,  1.79), nrow = 2, byrow = TRUE)
+
+
+tic()
+# run WOA
+sse_result <- WOA_quasirandom(
+  FUN = function(x) objective_SSE_double(x, double_data),
+  optimType = "MIN",
+  numVar = ncol(bounds),
+  numPopulation = 40, # default 40
+  maxIter = 500, # default 500
+  rangeVar = bounds)
+
+toc()
+
+best_sse <- objective_SSE_double(sse_result, double_data)
+
+print(sse_result)
+print(best_sse)
+```
+
+
+```{r}
+# define double_sig_formula for knowing the order for plotting
+# doublesigmoidalFitFormula_h0 <- function(x,
+#                                       finalAsymptoteIntensityRatio,
+#                                       maximum,
+#                                       slope1Param,
+#                                       midPoint1Param,
+#                                       slope2Param,
+#                                       midPointDistanceParam,
+#                                       h0)
+
+double_data |>
+  ggplot(aes(x = time, y = intensity)) +
+  geom_point() +
+  geom_line(aes(x = time, y = sicegar:::doublesigmoidalFitFormula_h0(time, 0.2865116/0.7174965, 0.7174965, 49.1378929, 0.3663755, 128.4211427, 1.2151188-0.3663755, 0.2297220)), color = "red")
+```
+
+
+
+# Levy flight
+
+Even though most of this work was done in a separate doc, I want it hear so i can rbind to all_results.
+
+First define the functions:
+
+```{r}
+engine_WOA_levy_at_end <- function(FUN, optimType, maxIter, lowerBound, upperBound, whale) {
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2)/maxIter)
+    a2 <- -1 + t * ((-1)/maxIter)
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      l <- (a2 - 1) * runif(1) + 1
+      p <- runif(1)
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * runif(1) + 
+              1)
+            x.rand <- whale[rand.index, ]
+            D.x.rand <- abs(C * x.rand[j] - whale[i, 
+              j])
+            whale[i, j] <- x.rand[j] - A * D.x.rand
+          }
+          else if (abs(A) < 1) {
+            D.bestPos <- abs(C * bestPos[j] - whale[i, 
+              j])
+            whale[i, j] <- bestPos[j] - A * D.bestPos
+          }
+        }
+        else if (p >= 0.5) {
+          distance <- abs(bestPos[j] - whale[i, j])
+          whale[i, j] <- distance * exp(b * l) * cos(l * 
+            2 * pi) + bestPos[j]
+        }
+      }
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, 
+        upperBound)
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    
+# this is the levy part
+    
+scalar <- 0.01  # step-size scaling which we could tune...
+
+for (i in 1:nrow(whale)) {
+  # generate levy vector for each whale
+  s <- levy_step(n = ncol(whale), beta = 1.5)
+  
+  # move whale by one levy step
+  whale[i, ] <- whale[i, ] + scalar * s
+  
+  # check bounds
+  whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+  
+  # recalc fitness
+  fitness <- optimType * FUN(whale[i, ])
+  if (fitness < FbestPos) {
+    FbestPos <- fitness
+    bestPos <- whale[i, ]
+  }
+}
+    # end of levy part
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+```
+
+
+
+```{r}
+WOA_levy_at_end <- function(FUN, optimType = "MIN", numVar, numPopulation = 40, 
+  maxIter = 500, rangeVar) 
+{
+  dimension <- ncol(rangeVar)
+  lowerBound <- rangeVar[1, ]
+  upperBound <- rangeVar[2, ]
+  if (dimension == 1) {
+    dimension <- numVar
+  }
+  if (optimType == "MAX") 
+    optimType <- -1
+  else optimType <- 1
+  whale <- generateRandom(numPopulation, dimension, lowerBound, 
+    upperBound)
+  bestPos <- engine_WOA_levy_at_end(FUN, optimType, maxIter, lowerBound, 
+    upperBound, whale)
+  return(bestPos)
+}
+```
+
+Test it:
+
+```{r}
+bounds <- matrix(c(-0.1, 0.3, -0.52, 0.01,
+                 0.35, 0.97, 1, 180), nrow = 2, ncol = 4, byrow = TRUE)
+
+# run WOA_quasirandom
+run_WOA_levy_at_end <- function(data) {
+  # running WOA_quasirandom
+  sse_result <- WOA_levy_at_end(
+    FUN = function(x) objective_SSE(x, data),
+    optimType = "MIN",
+    numVar = ncol(bounds),
+    numPopulation = 40,
+    maxIter = 500,
+    rangeVar = bounds
+  )
+  
+  # compute best SSE at that solution
+  best_sse <- objective_SSE(sse_result, data)
+  
+  # return both
+  list(
+    h0 = sse_result[1],
+    h1 = sse_result[2],
+    t1 = sse_result[3],
+    a  = sse_result[4],
+    best_sse = best_sse
+  )
+}
+tic()
+run_WOA_levy_at_end(norm_sig_data)
+toc()
+```
+
+
+Then I want to run on the same 250 datasets...
+
+```{r}
+library(furrr)
+library(R.utils)
+
+tic()
+WOA_leavy_at_end_df <- future_map2_dfr(
+  generated_data, seq_along(generated_data),
+  ~ run_woa_parallel(.x, .y, run_WOA_levy_at_end, "WOA_levy_at_end"),
+  seed = TRUE  # ensures parallel-safe independent RNG streams
+)
+toc()
+```
+
+
+
+

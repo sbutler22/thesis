@@ -1,0 +1,104 @@
+---
+title: "updated_levy"
+format: html
+---
+
+This function contains the Levy flights in the middle of the WOA algorithm
+
+# libraries
+
+```{r}
+# load libraries
+library(tidyverse)
+library(metaheuristicOpt)
+library(minpack.lm)
+library(furrr)
+library(R.utils)
+library(tictoc)
+library(randtoolbox)
+
+
+# source functions
+source("WOA_functions.R")
+```
+
+
+# function
+
+Since I know know that the 
+
+```{r}
+engine_WOA_levy_adaptive <- function(FUN, optimType, maxIter, lowerBound, upperBound, whale) {
+  whaleFitness <- calcFitness(FUN, optimType, whale)
+  index <- order(whaleFitness)
+  whaleFitness <- sort(whaleFitness)
+  whale <- whale[index, ]
+  bestPos <- whale[1, ]
+  FbestPos <- whaleFitness[1]
+  curve <- c()
+  progressbar <- txtProgressBar(min = 0, max = maxIter, style = 3)
+  
+  for (t in 1:maxIter) {
+    a <- 2 - t * ((2)/maxIter)
+    a2 <- -1 + t * ((-1)/maxIter)
+    
+    # ADAPTIVE LEVY SCALAR: Start at 0.1, shrink to 0.001
+    levy_scalar <- 0.1 * (1 - t/maxIter)^2 + 0.001
+    
+    for (i in 1:nrow(whale)) {
+      r1 <- runif(1)
+      r2 <- runif(1)
+      A <- 2 * a * r1 - a
+      C <- 2 * r2
+      b <- 1
+      l <- (a2 - 1) * runif(1) + 1
+      p <- runif(1)
+      
+      for (j in 1:ncol(whale)) {
+        if (p < 0.5) {
+          if (abs(A) >= 1) {
+            rand.index <- floor(nrow(whale) * runif(1) + 1)
+            x.rand <- whale[rand.index, ]
+            D.x.rand <- abs(C * x.rand[j] - whale[i, j])
+            whale[i, j] <- x.rand[j] - A * D.x.rand
+          } else {
+            D.bestPos <- abs(C * bestPos[j] - whale[i, j])
+            whale[i, j] <- bestPos[j] - A * D.bestPos
+          }
+        } else {
+          distance <- abs(bestPos[j] - whale[i, j])
+          whale[i, j] <- distance * exp(b * l) * cos(l * 2 * pi) + bestPos[j]
+        }
+      }
+      
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    
+    # Levy flight with ADAPTIVE step size
+    for (i in 1:nrow(whale)) {
+      s <- levy_step(n = ncol(whale), beta = 1.5)
+      whale[i, ] <- whale[i, ] + levy_scalar * s  # Use adaptive scalar
+      whale[i, ] <- checkBound(whale[i, ], lowerBound, upperBound)
+      
+      fitness <- optimType * FUN(whale[i, ])
+      if (fitness < FbestPos) {
+        FbestPos <- fitness
+        bestPos <- whale[i, ]
+      }
+    }
+    
+    curve[t] <- FbestPos
+    setTxtProgressBar(progressbar, t)
+  }
+  
+  close(progressbar)
+  curve <- curve * optimType
+  return(bestPos)
+}
+```
+
